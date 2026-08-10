@@ -1,0 +1,59 @@
+version: "3.9"
+# Full stack: the FastAPI app + Qdrant + Redis, all containerized.
+#
+# Named volumes matter here, not just for Qdrant/Redis data:
+#   repos_data — cloned repos persist across container restarts. Without
+#                this, incremental sync (/repos/{id}/sync) would re-clone
+#                from scratch every time the api container is recreated.
+#   hf_cache   — the ONNX embedder + CrossEncoder reranker models download
+#                once (~500MB+) and are cached here. Without this volume,
+#                every `docker-compose up --build` re-downloads both models.
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+    - qdrant_data:/qdrant/storage
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  api:
+    build: .
+    ports:
+      - "8001:8000"
+    env_file:
+      - .env
+    environment:
+      # These override anything in .env — inside the Docker network, the
+      # app must reach Qdrant/Redis by SERVICE NAME, not localhost.
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379
+      REPOS_DIR: /tmp/repos
+    volumes:
+      - repos_data:/tmp/repos
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      - qdrant
+      - redis
+
+volumes:
+  qdrant_data:
+  redis_data:
+  repos_data:
+  hf_cache:

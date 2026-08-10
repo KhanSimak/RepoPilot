@@ -1,0 +1,13 @@
+# Keeps the build context small and avoids baking secrets into image layers.
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.gitignore
+.env
+.env.*
+!.env.example
+*.zip
+.DS_Store

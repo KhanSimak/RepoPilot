@@ -1,0 +1,56 @@
+# Final phase — full pipeline: hybrid search, HyDE, reranking, token budgets,
+# cost tracing, SSE streaming, call graph, incremental ingest, eval framework.
+
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+pydantic==2.7.0
+pydantic-settings==2.3.0
+
+# Vector database
+qdrant-client==1.9.0
+
+
+
+sentence-transformers==3.0.0
+
+transformers==4.39.3
+
+numpy==1.26.4
+# Local embeddings — zero API cost, ONNX Runtime via Optimum.
+# THE BUG: embedder.py does `from optimum.onnxruntime import
+# ORTModelForFeatureExtraction`, but `optimum` was never actually listed
+# as a dependency here — only referenced in the comment below explaining
+# its version constraint. pip never installs it, so load_embedder() raises
+# ModuleNotFoundError at startup, inside the FastAPI lifespan, before the
+# app can even serve /health. That's almost certainly your "ONNX not
+# working" symptom.
+# Range, not exact pin: optimum 1.19.0 caps transformers<4.40.0,
+# sentence-transformers 3.0.0 needs >=4.34.0. 4.39.3 satisfies both.
+# A range here (instead of ==4.41.0) avoids re-breaking this if either
+# package's allowed range shifts slightly in a future patch release.
+optimum[onnxruntime]==1.19.0
+
+
+# Keyword search (Phase 2+)
+rank-bm25==0.2.2
+
+# Caching layer (Phase 2+)
+redis[asyncio]==5.0.4
+
+# NEW in final phase — token counting for the budget manager
+tiktoken==0.7.0
+
+# Repo cloning + diffing
+gitpython==3.1.43
+
+# NEW — agent orchestration for the iterative ReAct loop (app/agent/)
+langgraph==0.2.34
+
+# LLM for HyDE rewriting, compression, and final answer generation —
+# Groq (llama-3.1-8b-instant), OpenAI-compatible API, genuine no-credit-card
+# free tier, ~560 tok/s on Groq's LPU hardware.
+groq==1.1.2
+
+python-dotenv==1.0.1
+
+

@@ -37,6 +37,7 @@ async def retrieval_tool(
     redis_client,
     cfg,
     top_k: int = 20,
+    exact_symbol: str | None = None,
 ) -> list[dict]:
     """
     One retrieval pass, reusing your existing retrieve() exactly as the
@@ -44,7 +45,7 @@ async def retrieval_tool(
     (the agent's own reasoning IS the query refinement; a second nested
     HyDE call would be redundant and slower).
     """
-    return await retrieve(
+    candidates = await retrieve(
         question=query,
         hyde_snippet=query,
         phrases=_extract_phrases(query),
@@ -56,6 +57,24 @@ async def retrieval_tool(
         top_k=top_k,
         graph_expand=False,   # the agent loop does its OWN expansion via expand_graph_tool
     )
+
+    # A follow-up generated from a graph request names an exact repository
+    # symbol. Semantic retrieval may return similarly named code instead of
+    # that symbol, so resolve it against the repository index as evidence.
+    if not exact_symbol:
+        return candidates
+
+    all_repo_chunks = await scroll_repo_chunks(
+        qdrant_client, cfg.qdrant_collection, repo_id
+    )
+    exact_chunks = [
+        chunk for chunk in all_repo_chunks
+        if chunk.get("name") == exact_symbol
+    ]
+    seen_ids = {chunk["id"] for chunk in exact_chunks}
+    return exact_chunks + [
+        chunk for chunk in candidates if chunk["id"] not in seen_ids
+    ]
 
 
 async def expand_graph_tool(

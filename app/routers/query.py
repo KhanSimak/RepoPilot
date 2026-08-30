@@ -15,6 +15,7 @@ from fastapi import APIRouter, Request, HTTPException, Query as QParam
 from fastapi.responses import StreamingResponse
 
 from app.query.pipeline import run_query, stream_query, run_agentic_query
+from app.agent.graph import run_agent
 from app.routers.repos import get_registry
 
 router = APIRouter()
@@ -44,6 +45,62 @@ async def ask_agent(
 
     cfg, qdrant, redis_client = request.app.state.settings, request.app.state.qdrant, request.app.state.redis
     return await run_agentic_query(question, repo_id, qdrant, redis_client, cfg)
+
+
+@router.post("/{repo_id}/generate-diff")
+async def generate_diff(
+    repo_id: str,
+    request: Request,
+    change_request: str = QParam(
+        ..., min_length=3,
+        description="Plain-English description of the code change to make, e.g. "
+                     "'add input validation to the login endpoint'",
+    ),
+):
+    """
+    Proposes a code change as a unified diff.
+
+    Runs the SAME ReAct investigation loop as /ask/agent - retrieve +
+    expand_graph, gated by the same evidence-completeness checks (won't
+    propose a change from declarations/registration code alone) - but
+    forces intent="generate_code_change" so it terminates in
+    generate_diff_node instead of a prose answer. Unlike /ask/agent,
+    intent here is NOT auto-detected: the caller is explicitly asking for
+    a change, not a question to classify.
+
+    READ-ONLY: nothing in this call touches the repository. `proposed_diff`
+    is a unified diff (or null if the model couldn't safely propose one
+    from the gathered context) for you to review and apply yourself -
+    applying it is a separate, sandboxed step this endpoint doesn't do.
+    """
+    registry = get_registry()
+    if repo_id not in registry:
+        raise HTTPException(404, "Repo not found")
+    if registry[repo_id]["status"] != "done":
+        raise HTTPException(400, f"Repo not ready: {registry[repo_id]['status']}")
+
+    cfg, qdrant, redis_client = request.app.state.settings, request.app.state.qdrant, request.app.state.redis
+
+    result = await run_agent(
+        question=change_request,
+        repo_id=repo_id,
+        # The agent's own reasoning IS the query refinement (same rationale
+        # as tools.py's retrieval_tool) - no separate HyDE rewrite needed.
+        hyde_snippet=change_request,
+        intent="generate_code_change",
+        phrases=[],
+        qdrant_client=qdrant,
+        redis_client=redis_client,
+        cfg=cfg,
+    )
+
+    return {
+        "proposed_diff": result.get("proposed_diff"),
+        "diff_explanation": result.get("diff_explanation"),
+        "stop_reason": result.get("stop_reason"),
+        "iterations": result.get("iteration"),
+        "reasoning_trace": result.get("reasoning_trace"),
+    }
 
 
 @router.post("/{repo_id}/ask")

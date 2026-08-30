@@ -16,6 +16,7 @@ from app.agent.nodes import (
     answer_node,
     check_stop_condition,
 )
+from app.agent.codegen_nodes import generate_diff_node
 
 
 def build_agent_graph(qdrant_client, redis_client, cfg):
@@ -25,17 +26,24 @@ def build_agent_graph(qdrant_client, redis_client, cfg):
     graph.add_node("retrieve", partial(retrieve_node, qdrant_client=qdrant_client, redis_client=redis_client, cfg=cfg))
     graph.add_node("expand_graph", partial(expand_graph_node, qdrant_client=qdrant_client, cfg=cfg))
     graph.add_node("answer", answer_node)
+    graph.add_node("generate_diff", generate_diff_node)
 
     graph.set_entry_point("reasoning")
 
     graph.add_conditional_edges(
         "reasoning",
         check_stop_condition,
-        {"retrieve": "retrieve", "expand_graph": "expand_graph", "answer": "answer"},
+        {
+            "retrieve": "retrieve",
+            "expand_graph": "expand_graph",
+            "answer": "answer",
+            "generate_diff": "generate_diff",
+        },
     )
     graph.add_edge("retrieve", "reasoning")
     graph.add_edge("expand_graph", "reasoning")
     graph.add_edge("answer", END)
+    graph.add_edge("generate_diff", END)
 
     return graph.compile()
 
@@ -66,8 +74,12 @@ async def run_agent(
         "graph_name_index": None,
         "graph_qualified_index": None,
         "retrieval_exhausted": False,
+        "agent_input_tokens": 0,
+        "agent_output_tokens": 0,
         "final_answer": None,
         "stop_reason": None,
+        "proposed_diff": None,
+        "diff_explanation": None,
     }
 
     return await compiled.ainvoke(initial_state)

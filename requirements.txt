@@ -1,0 +1,65 @@
+# Final phase — full pipeline: hybrid search, HyDE, reranking, token budgets,
+# cost tracing, SSE streaming, call graph, incremental ingest, eval framework.
+
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+pydantic==2.7.0
+pydantic-settings==2.3.0
+
+openai==3.6.0
+cohere==7.1.0
+# Vector database
+qdrant-client==1.9.0
+
+# Local embedder (bge-small-en-v1.5) — direct onnxruntime.InferenceSession,
+# no optimum/PyTorch. Pin this to the exact version currently resolved in
+# your venv BEFORE you remove optimum (see step 1 below) so the runtime
+# you already validated in the comparison test doesn't silently change.
+onnxruntime==1.29.0
+
+# Tokenizer only — embedder.py now loads tokenizer.json directly via
+# tokenizers.Tokenizer.from_file(), confirmed from the actual promoted
+# file (it does NOT import transformers.AutoTokenizer). Pin this to
+# whatever version is CURRENTLY resolved in your venv (it's already
+# installed transitively via transformers, so this isn't a new/unvetted
+# version) with `pip show tokenizers`, same reasoning as the onnxruntime
+# pin above — the whole ~79MB transformers package is no longer needed
+# at all, not just optimum's use of it.
+tokenizers==0.15.2
+
+numpy==1.26.4
+
+# sentence-transformers REMOVED — the coding reranker now calls Cohere
+# rerank-v4.0-fast instead of a local CrossEncoder, so nothing in this
+# repo imports sentence_transformers anymore (confirm no other module you
+# haven't shown me still imports it before deleting this line for real).
+
+# optimum[onnxruntime] REMOVED — embedder.py talks to onnxruntime
+# directly; optimum's ORTModelForFeatureExtraction wrapper (and the
+# PyTorch it pulls in) is no longer used anywhere.
+#
+# transformers REMOVED — embedder.py loads tokenizer.json directly via
+# tokenizers.Tokenizer, confirmed from the actual file (not just the
+# task description). AutoTokenizer is no longer used anywhere.
+
+# Keyword search (Phase 2+)
+rank-bm25==0.2.2
+
+# Caching layer (Phase 2+)
+redis[asyncio]==5.0.4
+
+# NEW in final phase — token counting for the budget manager
+tiktoken==0.7.0
+
+# Repo cloning + diffing
+gitpython==3.1.43
+
+# NEW — agent orchestration for the iterative ReAct loop (app/agent/)
+langgraph==0.2.34
+
+# LLM for HyDE rewriting, compression, and final answer generation —
+# Groq (llama-3.1-8b-instant), OpenAI-compatible API, genuine no-credit-card
+# free tier, ~560 tok/s on Groq's LPU hardware.
+groq==1.1.2
+
+python-dotenv==1.0.1

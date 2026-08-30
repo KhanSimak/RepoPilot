@@ -52,7 +52,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://34.100.245.18:8080",
-        "http://localhost:5500",   # keep this for local development
+        "http://localhost:5501",
+        "http://127.0.0.1:5501",   # keep this for local development
     ],
     allow_credentials=True,
     allow_methods=["*"],

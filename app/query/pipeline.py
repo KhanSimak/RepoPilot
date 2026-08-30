@@ -28,7 +28,8 @@ chunk and the final chunk, so it's guarded below).
 import json
 import logging
 logger = logging.getLogger(__name__)   # was imported but never instantiated — needed below
-from groq import AsyncGroq
+from groq import AsyncGroq, RateLimitError
+from openai import AsyncOpenAI
 from app.schemas.api import SearchResponse
 from app.engine.cost_tracker import RequestTrace
 from app.engine.reranker import rerank, is_low_confidence
@@ -41,10 +42,72 @@ from app.agent.graph import run_agent
 import time
 settings = get_settings()
 
-_llm = AsyncGroq(
+_groq_llm = AsyncGroq(
     api_key=settings.groq_api_key
 )
+_openrouter_llm = (
+    AsyncOpenAI(
+        api_key=settings.openrouter_api_key,
+        base_url="https://openrouter.ai/api/v1",
+    )
+    if settings.openrouter_api_key
+    else None
+)
 
+
+async def _chat_with_fallback(
+    *,
+    messages: list[dict],
+    max_completion_tokens: int,
+    stream: bool = False,
+    response_format: dict | None = None,
+):
+    """Try Groq first; on a Groq rate-limit error, fall back to OpenRouter.
+
+    `stream` and `response_format` are forwarded to whichever provider
+    actually serves the request. Previously this hardcoded stream=True for
+    Groq and stream=False for the OpenRouter fallback regardless of what a
+    caller wanted - run_query (which needs a normal completion with
+    .choices[0].message) and stream_query (which needs an AsyncStream of
+    .choices[0].delta chunks) got the same, wrong, unconditional behavior
+    either way.
+    """
+    kwargs = {
+        "model": settings.groq_model,
+        "max_completion_tokens": max_completion_tokens,
+        "messages": messages,
+        "stream": stream,
+    }
+    if response_format is not None:
+        kwargs["response_format"] = response_format
+
+    try:
+        logger.info(
+            "Calling Groq model '%s'%s.",
+            settings.groq_model,
+            " with streaming" if stream else "",
+        )
+
+        return await _groq_llm.chat.completions.create(**kwargs)
+
+    except RateLimitError as exc:
+        logger.warning(
+            "Groq rate limit reached%s. Falling back to OpenRouter. Error: %s",
+            " during streaming" if stream else "",
+            exc,
+        )
+
+        if _openrouter_llm is None:
+            raise
+
+        logger.info(
+            "Calling OpenRouter model '%s'%s.",
+            settings.openrouter_model,
+            " with streaming" if stream else "",
+        )
+
+        kwargs["model"] = settings.openrouter_model
+        return await _openrouter_llm.chat.completions.create(**kwargs)
 
 async def _do_retrieval_and_rerank(
     question: str,
@@ -186,13 +249,16 @@ async def run_query(question: str, repo_id: str, qdrant_client, redis_client, cf
 )
     stage_llm.input_tokens = count_tokens(system_prompt) + count_tokens(user_msg)
 
-    response = await _llm.chat.completions.create(
-        model=settings.groq_model,
-        max_completion_tokens=400,
+    response = await _chat_with_fallback(
+        
+        # Was 400 - too tight for a repository-grounded explanation and
+        # cut answers off mid-sentence. Matches the agent loop's answer_node.
+        max_completion_tokens=1200,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_msg},
         ],
+        stream=False,
     )
     answer = response.choices[0].message.content
     stage_llm.output_tokens = count_tokens(answer)
@@ -333,13 +399,18 @@ async def stream_query(
 
     full_answer = []
 
-    stream = await _llm.chat.completions.create(
-        model=settings.groq_model,
-        max_completion_tokens=400,
+    stream = await _chat_with_fallback(
+        
+        # Was 400 - too tight for a repository-grounded explanation and cut
+        # answers off mid-sentence. Matches the agent loop's answer_node.
+        max_completion_tokens=1200,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_msg},
         ],
+        # Was stream=False here (backwards - this function iterates the
+        # response as a stream of .delta chunks right below, which only
+        # works when the provider was actually asked to stream).
         stream=True,
     )
 
@@ -393,6 +464,10 @@ async def run_agentic_query(question: str, repo_id: str, qdrant_client, redis_cl
 
     stage_rewrite = trace.start_stage("hyde_rewrite")
     rewrite = await rewrite_query(question, repo_id, redis_client)
+    # Keep this endpoint's rewrite accounting consistent with the normal
+    # /ask pipeline.  rewrite_query does not expose the SDK response object.
+    stage_rewrite.input_tokens = count_tokens(question) + 150
+    stage_rewrite.output_tokens = count_tokens(json.dumps(rewrite))
     stage_rewrite.finish()
 
     if rewrite["intent"] not in GRAPH_EXPAND_INTENTS:
@@ -410,6 +485,8 @@ async def run_agentic_query(question: str, repo_id: str, qdrant_client, redis_cl
         redis_client=redis_client,
         cfg=cfg,
     )
+    stage_agent.input_tokens = final_state.get("agent_input_tokens", 0)
+    stage_agent.output_tokens = final_state.get("agent_output_tokens", 0)
     stage_agent.finish()
 
     return {

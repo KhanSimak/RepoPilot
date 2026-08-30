@@ -1,0 +1,984 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codebase Q&amp;A Engine — Console + Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  /* ============================================================
+     LIGHT THEME — original index.html (test console). Unchanged
+     variable names/values. Governs page background + Tab 1.
+     ============================================================ */
+  :root {
+    --bg:        #F6F7F6;
+    --panel:     #FFFFFF;
+    --border:    #DCE0DD;
+    --text:      #14181B;
+    --text-dim:  #5B6360;
+    --mono:      'IBM Plex Mono', monospace;
+    --sans:      'Inter', system-ui, sans-serif;
+
+    --green-bg:  #E1F5EE; --green-tx: #0F6E56; --green-line: #1D9E75;
+    --amber-bg:  #FAEEDA; --amber-tx: #854F0B; --amber-line: #C98A1F;
+    --red-bg:    #FCEBEB; --red-tx:   #A32D2D; --red-line:  #E24B4A;
+    --purple-bg: #EEEDFE; --purple-tx:#3C3489; --purple-line:#534AB7;
+    --blue-bg:   #E6F1FB; --blue-tx:  #0C447C; --blue-line: #185FA5;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: var(--sans); font-size: 14px; line-height: 1.5;
+    padding: 24px; min-height: 100vh;
+  }
+  .wrap { max-width: 1160px; margin: 0 auto; }
+
+  header { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-end; margin-bottom: 20px; }
+  h1 { font-size: 19px; font-weight: 700; margin: 0 0 2px; letter-spacing: -0.01em; }
+  .sub { font-size: 12px; color: var(--text-dim); margin: 0; }
+  .conn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; align-items: center; }
+
+  label { font-size: 11px; color: var(--text-dim); display: block; margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.04em; }
+  input, select, textarea {
+    font-family: var(--mono); font-size: 13px; padding: 7px 9px;
+    border: 1px solid var(--border); border-radius: 6px; background: #fff; color: var(--text);
+    min-width: 0;
+  }
+  textarea { font-family: var(--sans); resize: vertical; }
+  input:focus, select:focus, textarea:focus, button:focus { outline: 2px solid var(--blue-line); outline-offset: 1px; }
+
+  button {
+    font-family: var(--sans); font-size: 13px; font-weight: 600; cursor: pointer;
+    border: 1px solid var(--border); border-radius: 6px; padding: 8px 14px;
+    background: #fff; color: var(--text); transition: border-color .15s, background .15s;
+    white-space: nowrap;
+  }
+  button:hover { border-color: var(--text-dim); }
+  button.primary  { background: var(--green-line); border-color: var(--green-line); color: #fff; }
+  button.primary:hover  { background: var(--green-tx); border-color: var(--green-tx); }
+  button.purple   { background: var(--purple-line); border-color: var(--purple-line); color: #fff; }
+  button.purple:hover   { background: var(--purple-tx); border-color: var(--purple-tx); }
+  button.danger   { background: var(--red-line); border-color: var(--red-line); color: #fff; }
+  button.danger:hover   { background: var(--red-tx); border-color: var(--red-tx); }
+  button.ghost    { background: transparent; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px 18px; margin-bottom: 16px;
+  }
+  .panel h2 { font-size: 13px; font-weight: 700; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .panel h2 .count { font-family: var(--mono); font-size: 11px; color: var(--text-dim); font-weight: 400; }
+  .panel h2 .spacer { flex: 1; }
+
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 10px; }
+  .field { flex: 1; min-width: 140px; }
+  .field.grow3 { flex: 3; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { font-size: 11px; text-transform: uppercase; letter-spacing: .03em; color: var(--text-dim); font-weight: 600; }
+  td.num { font-family: var(--mono); }
+  tr.dim td { color: var(--text-dim); }
+
+  .badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 20px; font-family: var(--mono); }
+  .badge.ok       { background: var(--green-bg);  color: var(--green-tx); }
+  .badge.warning  { background: var(--amber-bg);  color: var(--amber-tx); }
+  .badge.critical { background: var(--red-bg);    color: var(--red-tx); }
+  .badge.purple   { background: var(--purple-bg); color: var(--purple-tx); }
+  .badge.blue     { background: var(--blue-bg);   color: var(--blue-tx); }
+  .badge.neutral  { background: #EEF0EF; color: var(--text-dim); }
+
+  .empty { color: var(--text-dim); font-size: 13px; padding: 10px 2px; }
+
+  .stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; margin-bottom: 12px; }
+  .stat-box { background: #F1F3F1; border-radius: 8px; padding: 10px 12px; }
+  .stat-val { font-family: var(--mono); font-size: 17px; font-weight: 600; margin: 0 0 2px; }
+  .stat-lab { font-size: 10.5px; color: var(--text-dim); margin: 0; text-transform: uppercase; letter-spacing: .03em; }
+
+  .answer-box {
+    background: #F1F3F1; border-radius: 8px; padding: 14px 16px; font-size: 13.5px;
+    line-height: 1.65; white-space: pre-wrap; margin-bottom: 12px;
+  }
+  .answer-box.streaming::after {
+    content: '▋'; animation: blink 1s step-start infinite; color: var(--purple-line);
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  #console {
+    font-family: var(--mono); font-size: 11.5px; background: #14181B; color: #C8D0CC;
+    border-radius: 10px; padding: 12px 14px; height: 160px; overflow-y: auto;
+  }
+  #console p { margin: 0; line-height: 1.6; white-space: pre-wrap; word-break: break-all; }
+  #console .t-ok   { color: #6FE3B6; }
+  #console .t-err  { color: #FF8A8A; }
+  #console .t-info { color: #8FA6FF; }
+  #console .t-dim  { color: #6B746F; }
+
+  .setup-note {
+    background: var(--amber-bg); color: var(--amber-tx); border-radius: 8px;
+    padding: 10px 14px; font-size: 12.5px; margin-bottom: 16px; line-height: 1.6;
+  }
+  .setup-note code { background: rgba(0,0,0,0.06); padding: 1px 5px; border-radius: 4px; font-family: var(--mono); }
+  .setup-note.hidden { display: none; }
+
+  /* Ask sub-mode tabs (ask/search/stream) — inner pill tabs, only shown
+     when the "Ask" mode card below is active. Distinct from the
+     top-level page tabs further down. */
+  .tabs { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+  .tab-btn {
+    font-family: var(--sans); font-size: 12.5px; font-weight: 600; padding: 6px 12px;
+    border-radius: 20px; border: 1px solid var(--border); background: transparent; color: var(--text-dim); cursor: pointer;
+  }
+  .tab-btn.active { background: var(--text); color: #fff; border-color: var(--text); }
+
+  /* ============================================================
+     MODE CARDS — the top-level "how do you want to ask" choice
+     (Ask vs. Investigate). Deliberately bigger/heavier than
+     .tab-btn above: this is the primary decision on the panel,
+     not a minor variant switch, so it needs to read as such.
+     ============================================================ */
+  .mode-row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  .mode-card {
+    flex: 1; min-width: 220px; text-align: left; cursor: pointer;
+    background: #fff; border: 1.5px solid var(--border); border-radius: 10px;
+    padding: 12px 14px; font-family: var(--sans); transition: border-color .15s, background .15s;
+  }
+  .mode-card:hover { border-color: var(--purple-line); }
+  .mode-card .mode-title { font-size: 13.5px; font-weight: 700; display: flex; align-items: center; gap: 7px; margin: 0 0 3px; }
+  .mode-card .mode-desc { display: block; font-size: 11.5px; color: var(--text-dim); line-height: 1.45; margin: 0; }
+  .mode-card.active { border-color: var(--purple-line); background: var(--purple-bg); }
+  .mode-card.active .mode-title { color: var(--purple-tx); }
+  .mode-card .mode-badge {
+    display: inline-block; font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+    background: var(--purple-line); color: #fff; border-radius: 4px; padding: 1px 6px; margin-left: auto;
+  }
+
+  /* ============================================================
+     DIFF / PROPOSED-CHANGE OUTPUT — reuses the page's mono/panel
+     language, styled distinctly enough (left accent rule) to read
+     as "generated file content" rather than prose.
+     ============================================================ */
+  .diff-block {
+    font-family: var(--mono); font-size: 12px; line-height: 1.55; white-space: pre-wrap;
+    background: #14181B; color: #C8D0CC; border-radius: 8px; padding: 14px 16px;
+    border-left: 3px solid var(--purple-line); overflow-x: auto; margin-bottom: 12px;
+  }
+  .diff-block .add { color: #6FE3B6; }
+  .diff-block .rem { color: #FF8A8A; }
+  .diff-block .hunk { color: #8FA6FF; }
+
+  .source-card {
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; font-size: 12.5px;
+  }
+  .source-card .name { font-weight: 600; font-family: var(--mono); }
+  .source-card .meta { color: var(--text-dim); font-size: 11.5px; margin-top: 2px; }
+
+  progress { width: 100%; height: 6px; border-radius: 4px; overflow: hidden; border: none; margin-top: 4px; }
+  progress::-webkit-progress-bar { background: #EEF0EF; border-radius: 4px; }
+  progress::-webkit-progress-value { background: var(--purple-line); border-radius: 4px; }
+
+  /* ============================================================
+     TOP-LEVEL PAGE TABS — Test Console / Evaluation Dashboard.
+     Deliberately separate names (.main-tab-btn) from the Ask
+     panel's own .tab-btn above, so they don't collide.
+     ============================================================ */
+  #main-tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
+  .main-tab-btn {
+    background: transparent; border: none; border-bottom: 2px solid transparent;
+    color: var(--text-dim); font-family: var(--sans); font-size: 13px; font-weight: 700;
+    padding: 10px 16px; cursor: pointer; border-radius: 0;
+  }
+  .main-tab-btn.active { color: var(--purple-tx); border-bottom-color: var(--purple-line); }
+  .main-tab-panel { display: none; }
+  .main-tab-panel.active { display: block; }
+
+  .low-confidence-banner {
+    background: var(--amber-bg); color: var(--amber-tx); border-radius: 8px;
+    padding: 8px 12px; font-size: 12.5px; margin-bottom: 10px; display: none;
+  }
+  .reasoning-trace { font-family: var(--mono); font-size: 11.5px; background: #F1F3F1; border-radius: 8px; padding: 10px 12px; margin-top: 10px; }
+  .reasoning-trace p { margin: 0 0 6px; white-space: pre-wrap; }
+  .reasoning-trace p:last-child { margin-bottom: 0; }
+
+  /* ============================================================
+     EVALUATION DASHBOARD — light theme, same visual language as
+     the rest of the page (panel/stat-box/badge), no separate dark
+     styling.
+     ============================================================ */
+  .metric-card { text-align: center; }
+  .metric-card .stat-val.good  { color: var(--green-tx); }
+  .metric-card .stat-val.warn  { color: var(--amber-tx); }
+  .metric-card .stat-val.bad   { color: var(--red-tx); }
+  #ev-history { display: flex; gap: 6px; align-items: flex-end; height: 60px; margin: 8px 0; }
+  #ev-history .bar { flex: 1; background: var(--purple-line); border-radius: 3px 3px 0 0; min-height: 2px; position: relative; }
+  #ev-history .bar:hover::after {
+    content: attr(data-val); position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%);
+    background: var(--text); color: #fff; padding: 2px 6px; border-radius: 4px; font-size: 11px; white-space: nowrap; margin-bottom: 4px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div>
+      <h1>🔍 Codebase Q&amp;A Engine</h1>
+      <p class="sub">Ingest a repo, then Ask a quick question or Investigate one in depth, propose a change as a diff, run sync/eval — and watch retrieval metrics on the Evaluation Dashboard tab.</p>
+    </div>
+    <div class="conn-row">
+      <div>
+        <label for="api-base">API base URL</label>
+        <input id="api-base" value="http://127.0.0.1:8000" size="22">
+      </div>
+      <div>
+        <label for="repo-id">Repo ID</label>
+        <input id="repo-id" placeholder="none yet" size="10">
+      </div>
+    </div>
+  </header>
+
+  <div class="setup-note" id="cors-note">
+    <strong>First time? One backend change is needed.</strong> FastAPI blocks cross-origin requests by default, and this page (opened as a local file) counts as a different origin than your API. Add this to <code>app/main.py</code> right after <code>app = FastAPI(...)</code>, then restart the server:
+    <br><code>from fastapi.middleware.cors import CORSMiddleware</code>
+    <br><code>app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])</code>
+    <br>Once requests below succeed, this note won't matter — feel free to ignore it if CORS is already enabled.
+  </div>
+
+  <div id="main-tabs">
+    <button class="main-tab-btn active" data-tab="console">🔍 Test Console</button>
+    <button class="main-tab-btn" data-tab="eval">📊 Evaluation Dashboard</button>
+  </div>
+
+  <!-- ================= TAB 1: TEST CONSOLE (original index.html) ================= -->
+  <div id="maintab-console" class="main-tab-panel active">
+
+    <!-- ── Ingest panel ───────────────────────────────────────────────── -->
+    <div class="panel">
+      <h2>1 · Ingest a repo <span class="count" id="repo-status-badge"></span></h2>
+      <div class="row">
+        <div class="field grow3">
+          <label for="github-url">GitHub URL</label>
+          <input id="github-url" placeholder="https://github.com/encode/httpx" style="width:100%">
+        </div>
+        <div class="field" style="max-width:120px">
+          <label for="branch">Branch</label>
+          <input id="branch" value="main" style="width:100%">
+        </div>
+        <button class="primary" id="btn-ingest">Ingest</button>
+        <button class="ghost" id="btn-check-status">Check status →</button>
+      </div>
+      <div class="stat-row" id="repo-stats" style="display:none">
+        <div class="stat-box"><p class="stat-val" id="stat-chunks">—</p><p class="stat-lab">Chunks</p></div>
+        <div class="stat-box"><p class="stat-val" id="stat-files">—</p><p class="stat-lab">Files</p></div>
+        <div class="stat-box"><p class="stat-val" id="stat-langs">—</p><p class="stat-lab">Languages</p></div>
+        <div class="stat-box"><p class="stat-val" id="stat-status">—</p><p class="stat-lab">Status</p></div>
+      </div>
+    </div>
+
+    <!-- ── Ask panel ──────────────────────────────────────────────────── -->
+    <div class="panel">
+      <h2>2 · Ask a question</h2>
+
+      <div class="mode-row">
+        <button class="mode-card active" id="modecard-ask" data-topmode="ask" type="button">
+          <span class="mode-title">⚡ Ask</span>
+          <span class="mode-desc">One retrieval pass, straight to an answer. Fast — good for direct lookups ("where is X defined", "what does Y do").</span>
+        </button>
+        <button class="mode-card" id="modecard-investigate" data-topmode="investigate" type="button">
+          <span class="mode-title">🔎 Investigate <span class="mode-badge">multi-step</span></span>
+          <span class="mode-desc">Reasons iteratively — re-retrieves and expands the call graph based on what it finds, across as many files as it takes. Best for "how does X work end-to-end" questions. Slower than Ask, and shows its full reasoning trace below.</span>
+        </button>
+      </div>
+
+      <div class="tabs" id="ask-subtabs">
+        <button class="tab-btn active" data-mode="ask" id="tab-ask">Full pipeline</button>
+        <button class="tab-btn" data-mode="search" id="tab-search">Baseline search</button>
+        <button class="tab-btn" data-mode="stream" id="tab-stream">Streaming</button>
+      </div>
+
+      <div class="row">
+        <div class="field grow3">
+          <label for="question">Question</label>
+          <input id="question" placeholder="how does connection pooling work?" style="width:100%">
+        </div>
+        <div class="field" id="top-k-field" style="max-width:90px">
+          <label for="top-k">top_k</label>
+          <input id="top-k" type="number" value="5" min="1" max="10" style="width:100%">
+        </div>
+        <button class="purple" id="btn-ask">Ask</button>
+      </div>
+
+      <div id="answer-wrap" style="display:none">
+        <div class="low-confidence-banner" id="low-confidence-banner">
+          ⚠ Low confidence — the pipeline didn't find strongly relevant code for this question (see <code>is_low_confidence</code> in <code>reranker.py</code>). This usually means the question is out of scope for what's indexed.
+        </div>
+        <div class="answer-box" id="answer-box"></div>
+
+        <div class="stat-row" id="trace-stats" style="display:none">
+          <div class="stat-box"><p class="stat-val" id="trace-latency">—</p><p class="stat-lab">Total latency</p></div>
+          <div class="stat-box"><p class="stat-val" id="trace-cost">—</p><p class="stat-lab">Total cost</p></div>
+          <div class="stat-box"><p class="stat-val" id="trace-intent">—</p><p class="stat-lab">Detected intent</p></div>
+          <div class="stat-box"><p class="stat-val" id="trace-cache">—</p><p class="stat-lab">Cache hit</p></div>
+        </div>
+
+        <table id="trace-table" style="display:none;margin-bottom:12px">
+          <thead><tr><th>Stage</th><th>Latency</th><th>Cost</th><th>Tokens in/out</th><th>Cache?</th></tr></thead>
+          <tbody></tbody>
+        </table>
+
+        <div id="reasoning-wrap" style="display:none">
+          <p style="font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:var(--text-dim);margin:0 0 6px">Reasoning trace (Investigate mode only)</p>
+          <div class="reasoning-trace" id="reasoning-trace"></div>
+        </div>
+
+        <div id="sources-wrap">
+          <p style="font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:var(--text-dim);margin:12px 0 6px">Sources</p>
+          <div id="sources-list"></div>
+        </div>
+      </div>
+      <div id="ask-empty" class="empty">Ask a question above to see the answer, its source chunks, and a full per-stage cost trace. Investigate mode additionally shows the full iterative reasoning trace as it explores.</div>
+    </div>
+
+    <!-- ── Propose a change panel ────────────────────────────────────── -->
+    <div class="panel">
+      <h2>3 · Propose a change</h2>
+      <p style="font-size:12.5px;color:var(--text-dim);margin:0 0 12px">
+        Describe a change in plain English and the same investigation loop used by "Investigate" above will explore the codebase, then propose it as a unified diff for you to review. Read-only — nothing is applied to the repository.
+      </p>
+      <div class="row">
+        <div class="field grow3">
+          <label for="change-request">Describe the change</label>
+          <textarea id="change-request" rows="2" placeholder="add input validation to the login endpoint" style="width:100%"></textarea>
+        </div>
+        <button class="purple" id="btn-propose-change">Propose change</button>
+      </div>
+
+      <div id="diff-wrap" style="display:none">
+        <div class="stat-row" id="diff-stats">
+          <div class="stat-box"><p class="stat-val" id="diff-stop-reason">—</p><p class="stat-lab">Stop reason</p></div>
+          <div class="stat-box"><p class="stat-val" id="diff-iterations">—</p><p class="stat-lab">Iterations</p></div>
+        </div>
+        <p style="font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:var(--text-dim);margin:10px 0 6px">Explanation</p>
+        <div class="answer-box" id="diff-explanation"></div>
+        <p style="font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:var(--text-dim);margin:12px 0 6px">Proposed diff</p>
+        <div class="diff-block" id="diff-output"></div>
+        <div id="diff-reasoning-wrap" style="display:none">
+          <p style="font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:var(--text-dim);margin:12px 0 6px">Reasoning trace</p>
+          <div class="reasoning-trace" id="diff-reasoning-trace"></div>
+        </div>
+      </div>
+      <div id="diff-empty" class="empty">Describe a change above to have it investigated and proposed as a diff.</div>
+    </div>
+
+    <!-- ── Sync + Eval panel ──────────────────────────────────────────── -->
+    <div class="panel">
+      <h2>4 · Incremental sync &amp; evaluation</h2>
+      <div class="row">
+        <button id="btn-sync">Run incremental sync</button>
+        <button id="btn-eval">Run eval benchmark</button>
+        <div class="field" style="max-width:140px">
+          <label for="eval-max-q">max_questions</label>
+          <input id="eval-max-q" type="number" value="50" min="1" max="500" style="width:100%">
+        </div>
+        <span class="spacer"></span>
+        <button class="ghost" id="btn-cache-stats">Cache stats →</button>
+      </div>
+      <div id="sync-eval-result"><p class="empty">Run a sync or an eval benchmark to see results here. (For a fuller visual view of eval results, see the "Evaluation Dashboard" tab above.)</p></div>
+    </div>
+
+    <!-- ── Console ────────────────────────────────────────────────────── -->
+    <div class="panel">
+      <h2>Request log</h2>
+      <div id="console"></div>
+    </div>
+
+  </div>
+
+  <!-- ================= TAB 2: EVALUATION DASHBOARD ================= -->
+  <div id="maintab-eval" class="main-tab-panel">
+    <div class="panel">
+      <h2>Run retrieval eval
+        <span class="spacer"></span>
+        <div class="field" style="max-width:100px">
+          <input id="ev-max-questions" value="100">
+        </div>
+        <button class="purple" id="ev-btn-run">Run Eval</button>
+      </h2>
+      <p class="empty" id="ev-status" style="padding:0 0 8px">Hit "Run Eval" — calls your existing <code>POST /repos/eval/run</code>. Uses the same API base + repo ID as the Test Console tab.</p>
+
+      <div id="ev-results" style="display:none;">
+        <div class="stat-row" id="ev-cards"></div>
+
+        <p style="font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:var(--text-dim);margin:14px 0 6px">Run history (this session)</p>
+        <div id="ev-history"></div>
+        <p class="empty" style="padding:0">Recall@5 across runs in this browser session — not persisted, refresh clears it.</p>
+
+        <p style="font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:var(--text-dim);margin:14px 0 6px">Worst-performing files (Recall@5)</p>
+        <table>
+          <thead><tr><th>File</th><th>Recall@5</th><th>Questions</th></tr></thead>
+          <tbody id="ev-worst-files-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+/* ==================================================================
+   TOP-LEVEL PAGE TAB SWITCHING (Console / Eval)
+   ================================================================== */
+document.querySelectorAll('.main-tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.main-tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.main-tab-panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('maintab-' + btn.dataset.tab).classList.add('active');
+  });
+});
+
+/* ==================================================================
+   TAB 1 — TEST CONSOLE (original index.html logic, unchanged)
+   ================================================================== */
+const els = {
+  apiBase: document.getElementById('api-base'),
+  repoId: document.getElementById('repo-id'),
+  consoleEl: document.getElementById('console'),
+  corsNote: document.getElementById('cors-note'),
+
+  githubUrl: document.getElementById('github-url'),
+  branch: document.getElementById('branch'),
+  repoStatusBadge: document.getElementById('repo-status-badge'),
+  repoStats: document.getElementById('repo-stats'),
+  statChunks: document.getElementById('stat-chunks'),
+  statFiles: document.getElementById('stat-files'),
+  statLangs: document.getElementById('stat-langs'),
+  statStatus: document.getElementById('stat-status'),
+
+  question: document.getElementById('question'),
+  topK: document.getElementById('top-k'),
+  answerWrap: document.getElementById('answer-wrap'),
+  answerBox: document.getElementById('answer-box'),
+  askEmpty: document.getElementById('ask-empty'),
+  lowConfidenceBanner: document.getElementById('low-confidence-banner'),
+  traceStats: document.getElementById('trace-stats'),
+  traceLatency: document.getElementById('trace-latency'),
+  traceCost: document.getElementById('trace-cost'),
+  traceIntent: document.getElementById('trace-intent'),
+  traceCache: document.getElementById('trace-cache'),
+  traceTable: document.getElementById('trace-table'),
+  reasoningWrap: document.getElementById('reasoning-wrap'),
+  reasoningTrace: document.getElementById('reasoning-trace'),
+  sourcesList: document.getElementById('sources-list'),
+
+  askSubtabs: document.getElementById('ask-subtabs'),
+  topKField: document.getElementById('top-k-field'),
+  modeCardAsk: document.getElementById('modecard-ask'),
+  modeCardInvestigate: document.getElementById('modecard-investigate'),
+
+  changeRequest: document.getElementById('change-request'),
+  diffWrap: document.getElementById('diff-wrap'),
+  diffEmpty: document.getElementById('diff-empty'),
+  diffStopReason: document.getElementById('diff-stop-reason'),
+  diffIterations: document.getElementById('diff-iterations'),
+  diffExplanation: document.getElementById('diff-explanation'),
+  diffOutput: document.getElementById('diff-output'),
+  diffReasoningWrap: document.getElementById('diff-reasoning-wrap'),
+  diffReasoningTrace: document.getElementById('diff-reasoning-trace'),
+
+  syncEvalResult: document.getElementById('sync-eval-result'),
+};
+
+let mode = 'ask';       // 'ask' | 'search' | 'stream' | 'agent' — which API call Ask/Investigate makes
+let topMode = 'ask';    // 'ask' | 'investigate' — which mode card is active
+let lastAskSubmode = 'ask'; // remembers the ask/search/stream sub-tab across a trip to Investigate and back
+
+function log(msg, type = 'info') {
+  const p = document.createElement('p');
+  p.className = 't-' + type;
+  p.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  els.consoleEl.appendChild(p);
+  els.consoleEl.scrollTop = els.consoleEl.scrollHeight;
+}
+
+// SHARED by both tabs — the Eval Dashboard script below reuses these
+// same two functions rather than redefining them, since both tabs point
+// at the same API base + repo ID inputs.
+function apiBase() { return els.apiBase.value.replace(/\/+$/, ''); }
+function repoId() { return els.repoId.value.trim(); }
+
+async function api(path, opts = {}) {
+  const url = apiBase() + path;
+  log(`${opts.method || 'GET'} ${path}`, 'dim');
+  try {
+    const res = await fetch(url, {
+      headers: opts.body ? { 'Content-Type': 'application/json' } : {},
+      ...opts,
+    });
+    els.corsNote.classList.add('hidden');
+    if (!res.ok) {
+      const text = await res.text();
+      log(`✗ ${res.status} ${path} — ${text.slice(0, 200)}`, 'err');
+      return null;
+    }
+    const data = await res.json();
+    log(`✓ ${path}`, 'ok');
+    return data;
+  } catch (e) {
+    log(`✗ Network error on ${path}: ${e.message}. If this is your first request, check the CORS note above.`, 'err');
+    els.corsNote.classList.remove('hidden');
+    return null;
+  }
+}
+
+function statusBadgeHtml(status) {
+  const cls = status === 'done' ? 'ok' : status === 'failed' ? 'critical' : 'warning';
+  return `<span class="badge ${cls}">${status}</span>`;
+}
+
+// ── 1. Ingest ────────────────────────────────────────────────────────────
+
+async function ingestRepo() {
+  const url = els.githubUrl.value.trim();
+  if (!url) { log('Enter a GitHub URL first.', 'err'); return; }
+  const data = await api('/repos/', {
+    method: 'POST',
+    body: JSON.stringify({ github_url: url, branch: els.branch.value.trim() || 'main' }),
+  });
+  if (!data) return;
+  els.repoId.value = data.id;
+  els.repoStatusBadge.innerHTML = statusBadgeHtml(data.status);
+  log(`Ingest started for ${url} → repo_id=${data.id}. This runs in the background — click "Check status" to poll.`, 'ok');
+  pollUntilDone();
+}
+
+async function checkRepoStatus() {
+  if (!repoId()) { log('Enter or create a repo ID first.', 'err'); return; }
+  const data = await api(`/repos/${repoId()}`);
+  if (!data) return;
+  renderRepoStatus(data);
+  return data;
+}
+
+function renderRepoStatus(data) {
+  els.repoStatusBadge.innerHTML = statusBadgeHtml(data.status);
+  els.repoStats.style.display = 'grid';
+  els.statChunks.textContent = data.chunk_count ?? '—';
+  els.statFiles.textContent = data.file_count ?? '—';
+  els.statLangs.textContent = (data.languages || []).join(', ') || '—';
+  els.statStatus.textContent = data.status;
+  if (data.status === 'failed') {
+    log(`Ingest failed: ${data.error || 'unknown error'}`, 'err');
+  }
+}
+
+let pollTimer = null;
+function pollUntilDone() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(async () => {
+    const data = await checkRepoStatus();
+    if (data && data.status !== 'ingesting') {
+      clearInterval(pollTimer);
+      pollTimer = null;
+      log(`Repo ${data.status === 'done' ? 'ready' : 'failed'}.`, data.status === 'done' ? 'ok' : 'err');
+    }
+  }, 2500);
+}
+
+// ── 2. Ask / Search / Stream / Investigate ──────────────────────────────
+
+function setTopMode(newTopMode) {
+  topMode = newTopMode;
+  els.modeCardAsk.classList.toggle('active', topMode === 'ask');
+  els.modeCardInvestigate.classList.toggle('active', topMode === 'investigate');
+
+  if (topMode === 'investigate') {
+    // Investigate is always the agent loop — no sub-variant to pick, and
+    // top_k doesn't apply (the agent decides its own retrieval depth).
+    els.askSubtabs.style.display = 'none';
+    els.topKField.style.display = 'none';
+    setMode('agent');
+  } else {
+    els.askSubtabs.style.display = 'flex';
+    els.topKField.style.display = '';
+    setMode(lastAskSubmode);
+  }
+}
+
+function setMode(newMode) {
+  mode = newMode;
+  if (mode !== 'agent') lastAskSubmode = mode;
+  document.getElementById('tab-ask').classList.toggle('active', mode === 'ask');
+  document.getElementById('tab-search').classList.toggle('active', mode === 'search');
+  document.getElementById('tab-stream').classList.toggle('active', mode === 'stream');
+}
+
+function renderReasoningTrace(steps) {
+  if (!steps || !steps.length) { els.reasoningWrap.style.display = 'none'; return; }
+  els.reasoningWrap.style.display = 'block';
+  els.reasoningTrace.innerHTML = steps.map((s, i) => `<p>${i + 1}. ${s}</p>`).join('');
+}
+
+function renderSources(sources) {
+  if (!sources || !sources.length) {
+    els.sourcesList.innerHTML = '<p class="empty">No sources returned.</p>';
+    return;
+  }
+  els.sourcesList.innerHTML = sources.map(s => `
+    <div class="source-card">
+      <span class="name">${s.name || '(unnamed)'}</span>
+      <span class="badge neutral" style="margin-left:6px">${s.type || ''}</span>
+      ${s.score != null ? `<span class="badge blue" style="margin-left:4px">score ${(+s.score).toFixed(3)}</span>` : ''}
+      <div class="meta">${s.file || ''}${s.line_start != null ? ` · L${s.line_start}–${s.line_end}` : ''}</div>
+    </div>
+  `).join('');
+}
+
+function renderTrace(trace) {
+  if (!trace) { els.traceStats.style.display = 'none'; els.traceTable.style.display = 'none'; return; }
+  els.traceStats.style.display = 'grid';
+  els.traceLatency.textContent = `${trace.total_latency_ms?.toFixed(1) ?? '—'} ms`;
+  els.traceCost.textContent = `$${(trace.total_cost_usd ?? 0).toFixed(6)}`;
+  els.traceIntent.textContent = trace.intent || '—';
+
+  const tbody = els.traceTable.querySelector('tbody');
+  tbody.innerHTML = (trace.stages || []).map(s => `
+    <tr class="${s.cache_hit ? '' : 'dim'}">
+      <td>${s.stage}</td>
+      <td class="num">${s.latency_ms?.toFixed(1) ?? '—'} ms</td>
+      <td class="num">$${(s.cost_usd ?? 0).toFixed(6)}</td>
+      <td class="num">${s.tokens_in ?? 0} / ${s.tokens_out ?? 0}</td>
+      <td>${s.cache_hit ? '<span class="badge ok">hit</span>' : '<span class="badge neutral">—</span>'}</td>
+    </tr>
+  `).join('');
+  els.traceTable.style.display = 'table';
+}
+
+async function askQuestion() {
+  const q = els.question.value.trim();
+  if (!q) { log('Type a question first.', 'err'); return; }
+  if (!repoId()) { log('Ingest or load a repo first.', 'err'); return; }
+
+  els.askEmpty.style.display = 'none';
+  els.answerWrap.style.display = 'block';
+  els.answerBox.textContent = '';
+  els.lowConfidenceBanner.style.display = 'none';
+  els.traceStats.style.display = 'none';
+  els.traceTable.style.display = 'none';
+  els.traceCache.textContent = '—';
+  els.reasoningWrap.style.display = 'none';
+  els.sourcesList.innerHTML = '<p class="empty">Loading…</p>';
+
+  const topK = els.topK.value || 5;
+  const qs = `question=${encodeURIComponent(q)}&top_k=${topK}`;
+
+  if (mode === 'ask') {
+    const data = await api(`/repos/${repoId()}/ask?${qs}`, { method: 'POST' });
+    if (!data) { els.answerBox.textContent = '(request failed — see log below)'; return; }
+    els.answerBox.textContent = data.answer || '(no answer)';
+    els.lowConfidenceBanner.style.display = data.low_confidence ? 'block' : 'none';
+    els.traceCache.textContent = data.cache_hit ? 'yes' : 'no';
+    renderTrace(data.trace);
+    renderSources(data.sources);
+  } else if (mode === 'search') {
+    const data = await api(`/repos/${repoId()}/search?${qs}`);
+    if (!data) { els.answerBox.textContent = '(request failed — see log below)'; return; }
+    els.answerBox.textContent = data.answer || '(no answer)';
+    if (data.latency_ms) {
+      els.traceStats.style.display = 'grid';
+      els.traceLatency.textContent = `${data.latency_ms.total_ms ?? '—'} ms`;
+      els.traceCost.textContent = '(baseline — no trace)';
+      els.traceIntent.textContent = '—';
+      els.traceCache.textContent = data.latency_ms.cache_hit ? 'yes' : 'no';
+    }
+    els.traceTable.style.display = 'none';
+    renderSources(data.sources);
+  } else if (mode === 'agent') {
+    const data = await api(`/repos/${repoId()}/ask/agent?${qs}`, { method: 'POST' });
+    if (!data) { els.answerBox.textContent = '(request failed — see log below)'; return; }
+    els.answerBox.textContent = data.answer || '(no answer)';
+    els.lowConfidenceBanner.style.display = data.low_confidence ? 'block' : 'none';
+    els.traceCache.textContent = data.cache_hit ? 'yes' : 'no';
+    if (data.trace) renderTrace(data.trace);
+    if (data.intent) { els.traceStats.style.display = 'grid'; els.traceIntent.textContent = `${data.intent}${data.iterations != null ? ` (${data.iterations} iter)` : ''}`; }
+    renderReasoningTrace(data.reasoning_trace);
+    renderSources(data.sources);
+  } else {
+    await streamQuestion(q, topK);
+  }
+}
+
+async function streamQuestion(question, topK) {
+  els.answerBox.classList.add('streaming');
+  els.sourcesList.innerHTML = '<p class="empty">Waiting for sources…</p>';
+
+  const url = `${apiBase()}/repos/${repoId()}/stream?question=${encodeURIComponent(question)}&top_k=${topK}`;
+  log(`GET (SSE) ${url.replace(apiBase(), '')}`, 'dim');
+
+  let answerText = '';
+  let resp;
+  try {
+    resp = await fetch(url);
+  } catch (e) {
+    log(`✗ Stream connection failed: ${e.message}`, 'err');
+    els.corsNote.classList.remove('hidden');
+    els.answerBox.classList.remove('streaming');
+    return;
+  }
+  if (!resp.ok || !resp.body) {
+    log(`✗ Stream request failed with status ${resp.status}`, 'err');
+    els.answerBox.classList.remove('streaming');
+    return;
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const lines = buffer.split('\n\n');
+    buffer = lines.pop();
+
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      let evt;
+      try { evt = JSON.parse(line.slice(6)); } catch { continue; }
+
+      if (evt.type === 'sources') {
+        renderSources(evt.sources);
+        if (evt.intent) { els.traceStats.style.display = 'grid'; els.traceIntent.textContent = evt.intent; }
+        log(`Sources received (rewrite: "${(evt.rewrite || '').slice(0, 60)}…")`, 'info');
+      } else if (evt.type === 'token') {
+        answerText += evt.text;
+        els.answerBox.textContent = answerText;
+      } else if (evt.type === 'done') {
+        renderTrace(evt.trace);
+        log('Stream complete.', 'ok');
+      } else if (evt.type === 'error') {
+        log(`Stream error: ${evt.text}`, 'err');
+      }
+    }
+  }
+  els.answerBox.classList.remove('streaming');
+}
+
+// ── 3. Propose a change ─────────────────────────────────────────────────
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function renderDiffBlock(diffText) {
+  if (!diffText) { els.diffOutput.innerHTML = '<span style="color:var(--text-dim)">(no diff proposed)</span>'; return; }
+  els.diffOutput.innerHTML = diffText.split('\n').map(line => {
+    const esc = escapeHtml(line);
+    if (line.startsWith('+') && !line.startsWith('+++')) return `<span class="add">${esc}</span>`;
+    if (line.startsWith('-') && !line.startsWith('---')) return `<span class="rem">${esc}</span>`;
+    if (line.startsWith('@@')) return `<span class="hunk">${esc}</span>`;
+    return esc;
+  }).join('\n');
+}
+
+async function proposeChange() {
+  const changeRequest = els.changeRequest.value.trim();
+  if (!changeRequest) { log('Describe a change first.', 'err'); return; }
+  if (!repoId()) { log('Ingest or load a repo first.', 'err'); return; }
+
+  els.diffEmpty.style.display = 'none';
+  els.diffWrap.style.display = 'block';
+  els.diffExplanation.textContent = 'Investigating and drafting a change…';
+  els.diffOutput.textContent = '';
+  els.diffReasoningWrap.style.display = 'none';
+
+  const qs = `change_request=${encodeURIComponent(changeRequest)}`;
+  const data = await api(`/repos/${repoId()}/generate-diff?${qs}`, { method: 'POST' });
+  if (!data) { els.diffExplanation.textContent = '(request failed — see log below)'; return; }
+
+  els.diffStopReason.textContent = data.stop_reason || '—';
+  els.diffIterations.textContent = data.iterations ?? '—';
+  els.diffExplanation.textContent = data.diff_explanation || '(no explanation returned)';
+  renderDiffBlock(data.proposed_diff);
+  if (data.reasoning_trace && data.reasoning_trace.length) {
+    els.diffReasoningWrap.style.display = 'block';
+    els.diffReasoningTrace.innerHTML = data.reasoning_trace.map((s, i) => `<p>${i + 1}. ${s}</p>`).join('');
+  }
+  log(data.proposed_diff ? 'Change proposed.' : 'Investigation finished, but no diff could be safely proposed.', data.proposed_diff ? 'ok' : 'info');
+}
+
+// ── 4. Sync & Eval (inline summary, same as original index.html) ───────
+
+async function runSync() {
+  if (!repoId()) { log('Ingest or load a repo first.', 'err'); return; }
+  els.syncEvalResult.innerHTML = '<p class="empty">Syncing…</p>';
+  const data = await api(`/repos/${repoId()}/sync`, { method: 'POST' });
+  if (!data) { els.syncEvalResult.innerHTML = '<p class="empty">Sync request failed — see log below.</p>'; return; }
+
+  log('Sync started in background — polling for completion…', 'info');
+  const poll = setInterval(async () => {
+    const status = await api(`/repos/${repoId()}`);
+    if (status && status.status !== 'ingesting') {
+      clearInterval(poll);
+      const sync = status.last_sync || {};
+      els.syncEvalResult.innerHTML = `
+        <div class="stat-row">
+          <div class="stat-box"><p class="stat-val">${sync.mode || '—'}</p><p class="stat-lab">Mode</p></div>
+          <div class="stat-box"><p class="stat-val">${sync.changed_files ?? '—'}</p><p class="stat-lab">Changed files</p></div>
+          <div class="stat-box"><p class="stat-val">${sync.embedded_chunks ?? '—'}</p><p class="stat-lab">Re-embedded</p></div>
+          <div class="stat-box"><p class="stat-val">${sync.skipped_chunks ?? '—'}</p><p class="stat-lab">Skipped (unchanged)</p></div>
+        </div>`;
+      log(`Sync finished: ${sync.embedded_chunks ?? 0} re-embedded, ${sync.skipped_chunks ?? 0} skipped.`, 'ok');
+      renderRepoStatus(status);
+    }
+  }, 2000);
+}
+
+async function runEval() {
+  if (!repoId()) { log('Ingest or load a repo first.', 'err'); return; }
+  const maxQ = document.getElementById('eval-max-q').value;
+  els.syncEvalResult.innerHTML = '<p class="empty">Running benchmark — this can take a little while…</p>';
+  const data = await api(`/eval/run?repo_id=${repoId()}&max_questions=${maxQ}`, { method: 'POST' });
+  if (!data) { els.syncEvalResult.innerHTML = '<p class="empty">Eval request failed — see log below.</p>'; return; }
+  if (data.error) { els.syncEvalResult.innerHTML = `<p class="empty">${data.error}</p>`; return; }
+
+  const worstRows = (data.worst_files || []).map(f => `
+    <tr><td>${f.file}</td><td class="num">${(f.recall * 100).toFixed(0)}%</td><td class="num">${f.question_count}</td></tr>
+  `).join('') || '<tr><td class="empty" colspan="3">No per-file data.</td></tr>';
+
+  els.syncEvalResult.innerHTML = `
+    <div class="stat-row">
+      <div class="stat-box"><p class="stat-val">${(data.recall_at_5 * 100).toFixed(1)}%</p><p class="stat-lab">Recall@5</p></div>
+      <div class="stat-box"><p class="stat-val">${(data.recall_at_10 * 100).toFixed(1)}%</p><p class="stat-lab">Recall@10</p></div>
+      <div class="stat-box"><p class="stat-val">${data.mrr.toFixed(3)}</p><p class="stat-lab">MRR</p></div>
+      ${data.ndcg_at_5 != null ? `<div class="stat-box"><p class="stat-val">${data.ndcg_at_5.toFixed(3)}</p><p class="stat-lab">nDCG@5</p></div>` : ''}
+      <div class="stat-box"><p class="stat-val">${data.latency_ms.p95} ms</p><p class="stat-lab">Latency P95</p></div>
+      <div class="stat-box"><p class="stat-val">${data.questions_run}</p><p class="stat-lab">Questions run</p></div>
+    </div>
+    <p style="font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:var(--text-dim);margin:12px 0 6px">Worst-performing files</p>
+    <table><thead><tr><th>File</th><th>Recall@5</th><th>Questions</th></tr></thead><tbody>${worstRows}</tbody></table>
+  `;
+  log(`Eval complete: Recall@5=${(data.recall_at_5*100).toFixed(1)}%, MRR=${data.mrr.toFixed(3)}`, 'ok');
+}
+
+async function cacheStats() {
+  const data = await api('/stats/cache');
+  if (!data) return;
+  const s = data.redis_stats || {};
+  els.syncEvalResult.innerHTML = `
+    <div class="stat-row">
+      <div class="stat-box"><p class="stat-val">${s.hits ?? '—'}</p><p class="stat-lab">Cache hits</p></div>
+      <div class="stat-box"><p class="stat-val">${s.misses ?? '—'}</p><p class="stat-lab">Cache misses</p></div>
+      <div class="stat-box"><p class="stat-val">${s.hit_rate_pct ?? '—'}%</p><p class="stat-lab">Hit rate</p></div>
+    </div>
+    <p class="empty" style="margin-top:8px">${data.note || ''}</p>
+  `;
+}
+
+document.getElementById('btn-ingest').onclick = ingestRepo;
+document.getElementById('btn-check-status').onclick = checkRepoStatus;
+document.getElementById('btn-ask').onclick = askQuestion;
+document.getElementById('tab-ask').onclick = () => setMode('ask');
+document.getElementById('tab-search').onclick = () => setMode('search');
+document.getElementById('tab-stream').onclick = () => setMode('stream');
+els.modeCardAsk.onclick = () => setTopMode('ask');
+els.modeCardInvestigate.onclick = () => setTopMode('investigate');
+document.getElementById('btn-propose-change').onclick = proposeChange;
+document.getElementById('btn-sync').onclick = runSync;
+document.getElementById('btn-eval').onclick = runEval;
+document.getElementById('btn-cache-stats').onclick = cacheStats;
+els.question.addEventListener('keydown', (e) => { if (e.key === 'Enter') askQuestion(); });
+els.changeRequest.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) proposeChange(); });
+
+log('Ready. Paste a GitHub URL above and click "Ingest" to get started.', 'info');
+
+/* ==================================================================
+   TAB 2 — EVALUATION DASHBOARD (light theme, reuses .stat-box/table
+   from the rest of the page — no separate dark styling)
+   ================================================================== */
+const evalRunHistory = [];
+
+function setEvStatus(msg, isError = false) {
+  const el = document.getElementById('ev-status');
+  el.textContent = msg;
+  el.style.color = isError ? 'var(--red-tx)' : '';
+}
+
+function scoreClass(v) {
+  if (v >= 0.8) return 'good';
+  if (v >= 0.5) return 'warn';
+  return 'bad';
+}
+
+document.getElementById('ev-btn-run').addEventListener('click', runEvalDashboard);
+
+async function runEvalDashboard() {
+  if (!repoId()) { setEvStatus('Enter a repo-id first (Test Console tab, top of page)', true); return; }
+  const maxQ = document.getElementById('ev-max-questions').value || 100;
+  const btn = document.getElementById('ev-btn-run');
+
+  btn.disabled = true;
+  setEvStatus('Running eval — this re-runs retrieval for every golden-dataset question, may take a bit...');
+
+  try {
+    const res = await fetch(`${apiBase()}/repos/eval/run?repo_id=${encodeURIComponent(repoId())}&max_questions=${maxQ}`, { method: 'POST' });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    if (data.error) { setEvStatus(data.error, true); btn.disabled = false; return; }
+    setEvStatus(`Done — ${data.questions_run} questions run against "${data.repo_id}"`);
+    renderEvalDashboard(data);
+  } catch (e) {
+    setEvStatus('Eval failed: ' + e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderEvalDashboard(data) {
+  document.getElementById('ev-results').style.display = 'block';
+
+  const metrics = [
+    { label: 'Recall@5',  value: data.recall_at_5,  fmt: v => (v * 100).toFixed(1) + '%' },
+    { label: 'Recall@10', value: data.recall_at_10, fmt: v => (v * 100).toFixed(1) + '%' },
+    { label: 'MRR',       value: data.mrr,          fmt: v => v.toFixed(3) },
+    { label: 'nDCG@5',    value: data.ndcg_at_5 ?? null, fmt: v => v.toFixed(3) },
+    { label: 'Latency P95', value: data.latency_ms.p95, fmt: v => v + ' ms', noScore: true },
+    { label: 'Questions', value: data.questions_run, fmt: v => v, noScore: true },
+  ];
+
+  document.getElementById('ev-cards').innerHTML = metrics.map(m => {
+    if (m.value === null || m.value === undefined) {
+      return `<div class="stat-box metric-card"><p class="stat-val" style="font-size:12px;color:var(--text-dim)">n/a</p><p class="stat-lab">${m.label}</p></div>`;
+    }
+    const cls = m.noScore ? '' : scoreClass(m.value);
+    return `<div class="stat-box metric-card"><p class="stat-val ${cls}">${m.fmt(m.value)}</p><p class="stat-lab">${m.label}</p></div>`;
+  }).join('');
+
+  const worstBody = document.getElementById('ev-worst-files-body');
+  worstBody.innerHTML = (data.worst_files || []).map(f => `
+    <tr>
+      <td>${f.file}</td>
+      <td class="num badge ${f.recall >= 0.8 ? 'ok' : f.recall >= 0.5 ? 'warning' : 'critical'}">${(f.recall * 100).toFixed(1)}%</td>
+      <td class="num">${f.question_count}</td>
+    </tr>
+  `).join('') || '<tr><td class="empty" colspan="3">No file-level data</td></tr>';
+
+  evalRunHistory.push({ recall: data.recall_at_5, time: new Date().toLocaleTimeString() });
+  renderEvalHistory();
+}
+
+function renderEvalHistory() {
+  const box = document.getElementById('ev-history');
+  const max = Math.max(...evalRunHistory.map(r => r.recall), 0.1);
+  box.innerHTML = evalRunHistory.map(r => `
+    <div class="bar" style="height:${(r.recall / max) * 100}%" data-val="${(r.recall*100).toFixed(1)}% at ${r.time}"></div>
+  `).join('');
+}
+</script>
+</body>
+</html>

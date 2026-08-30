@@ -32,12 +32,16 @@ WHY TIKTOKEN WHEN WE'RE CALLING GROQ, NOT OPENAI:
 
 import asyncio
 import logging
+import re
 from groq import AsyncGroq
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 _llm = AsyncGroq()
 
-GROQ_MODEL = "llama-3.1-8b-instant"
+settings = get_settings()
+
+GROQ_MODEL = settings.groq_model
 
 try:
     import tiktoken
@@ -53,6 +57,22 @@ except Exception:
 MAX_CONTEXT_TOKENS   = 2500   # hard cap on total context sent to the final LLM call
 MAX_TOKENS_PER_CHUNK = 150   # budget for each individual compression call
 
+
+def _tighten_instructions(text: str) -> str:
+    """Collapse blank-line padding in static, code-free instruction text.
+
+    build_prompt()'s system_prompt (the rules list + intent task block) is
+    sent on every single final-answer call and is almost entirely blank
+    lines between one-sentence rules - none of that spacing changes what
+    the rules say, it just costs tokens on every request. This only
+    collapses runs of blank lines down to a single newline; every word of
+    every rule is left exactly as written, same order, same numbering.
+
+    Deliberately NOT applied to `context` (retrieved code/docstrings) or
+    the chunk text embedded in the final user message - only to this
+    static instructional string, which never contains code.
+    """
+    return re.sub(r"\n[ \t]*\n+", "\n", text).strip()
 
 
 def select_context(chunks: list[dict], max_tokens: int = MAX_CONTEXT_TOKENS):
@@ -341,6 +361,7 @@ say what information is missing instead of guessing.
 """
 
     system_prompt += "\n\n" + task
+    system_prompt = _tighten_instructions(system_prompt)
 
     # --------------------------------------------------
     # Build repository context

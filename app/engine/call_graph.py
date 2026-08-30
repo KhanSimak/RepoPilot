@@ -39,9 +39,37 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def _bare_symbol_name(name: str) -> str:
-    """Return the terminal method/function name used by AST call extraction."""
-    return name.rsplit(".", 1)[-1]
+def _resolve_callee_chunks(callee_name: str, name_to_chunks: dict[str, list]) -> list:
+    """
+    Resolve a bare callee name extracted from a call site to the chunk(s)
+    it actually invokes.
+
+    A direct name match covers the common case. One systematic mismatch:
+    a constructor call `ClassName(...)` is extracted from the AST as a
+    call to the bare class name ("Flask", "Foo", whatever the class is
+    called) — see the STEP 2 matching caveat at the top of this file. But
+    the code that actually runs when that call executes is the class's
+    __init__ method, whose chunk is named with this repo's qualified
+    method naming scheme, "ClassName.__init__" — never the bare class
+    name. So a direct name-to-name match alone never connects an
+    instantiation site to its constructor: EVERY class's __init__ is
+    call-graph-isolated the moment it's only ever reached via `ClassName(
+    ...)`, not because of anything Flask-specific but because of this
+    generic bare-name-vs-qualified-name mismatch. Resolve it once, here,
+    for any class in the repo: if the bare name matches a class chunk,
+    also route the edge to that class's "<ClassName>.__init__" chunk(s),
+    if one exists.
+    """
+    matches = name_to_chunks.get(callee_name, [])
+    resolved = list(matches)
+
+    for candidate in matches:
+        if getattr(candidate, "type", None) == "class":
+            for init_chunk in name_to_chunks.get(f"{callee_name}.__init__", []):
+                if init_chunk not in resolved:
+                    resolved.append(init_chunk)
+
+    return resolved
 
 
 def build_called_by(all_chunks: list) -> None:
@@ -54,28 +82,11 @@ def build_called_by(all_chunks: list) -> None:
     """
     name_to_chunks: dict[str, list] = {}
     for chunk in all_chunks:
-        # Calls extracted from ``obj.method()`` are bare names (``method``),
-        # while method chunks are stored as ``Class.method``.  Index both
-        # representations so graph inversion uses the same identifier form as
-        # traversal.
         name_to_chunks.setdefault(chunk.name, []).append(chunk)
-        bare_name = _bare_symbol_name(chunk.name)
-        if bare_name != chunk.name:
-            name_to_chunks.setdefault(bare_name, []).append(chunk)
 
     for chunk in all_chunks:
         for callee_name in chunk.calls:
-            # Prefer the caller's own class for ``self.method()``-shaped
-            # bare calls before considering repository-wide bare matches.
-            scoped_name = None
-            if "." in chunk.name and "." not in callee_name:
-                scoped_name = f"{chunk.name.rsplit('.', 1)[0]}.{callee_name}"
-            candidates = name_to_chunks.get(scoped_name, []) if scoped_name else []
-            if not candidates:
-                exact = name_to_chunks.get(callee_name, [])
-                exact_named = [c for c in exact if c.name == callee_name]
-                candidates = exact_named or exact
-            for callee_chunk in candidates:
+            for callee_chunk in _resolve_callee_chunks(callee_name, name_to_chunks):
                 if chunk.name not in callee_chunk.called_by:
                     callee_chunk.called_by.append(chunk.name)
 
@@ -90,7 +101,7 @@ def expand_by_graph(
     depth: int = 1,
     direction: str = "both",
     
-    max_expanded: int = 10,
+    max_expanded: int = 15,
 ) -> list[dict]:
 
     visited_ids = {c["id"] for c in entry_chunks}
@@ -134,39 +145,35 @@ def expand_by_graph(
 
             # Flask special cases
 
-            for name in sorted(neighbor_names):
+            for name in neighbor_names:
 
                 current_file = chunk["file"]
 
-                # Resolve a bare method call to its current class first.
-                scoped_name = None
-                if "." in chunk.get("name", "") and "." not in name:
-                    scoped_name = f"{chunk['name'].rsplit('.', 1)[0]}.{name}"
+# Try exact file + symbol first
+                neighbors = qualified_index.get((current_file, name))
 
-                neighbor = (
-                    qualified_index.get((current_file, scoped_name))
-                    if scoped_name else None
-                )
-                if neighbor:
-                    neighbors = [neighbor]
+                if neighbors is not None:
+                    neighbors = [neighbors]      # if qualified_index stores a single chunk
                 else:
-                    exact_neighbors = [
-                        candidate for candidate in name_index.get(name, [])
-                        if candidate.get("name") == name
-                    ]
-                    neighbors = exact_neighbors or name_index.get(name, [])
-                neighbors = sorted(
-                    neighbors,
-                    key=lambda candidate: (
-                        candidate.get("file", ""),
-                        candidate.get("line_start", 0),
-                        candidate.get("id", ""),
-                    ),
-                )
+                    neighbors = name_index.get(name, [])
+
+                # Constructor resolution, mirrored from build_called_by's
+                # ingest-time fix: a bare call target that names a class
+                # (`ClassName(...)`) should also reach that class's
+                # __init__ chunk, wherever it's defined — not just when
+                # the class happens to be in the same file as the call
+                # (the qualified_index branch above) or already carries a
+                # called_by edge from ingest. Generic for any class.
+                neighbors = list(neighbors)
+                for neighbor in list(neighbors):
+                    if neighbor.get("type") == "class":
+                        for init_chunk in name_index.get(f"{name}.__init__", []):
+                            if init_chunk not in neighbors:
+                                neighbors.append(init_chunk)
 
                 for neighbor in neighbors:
 
-                    normalized = "/" + neighbor["file"].replace("\\", "/")
+                    normalized = neighbor["file"].replace("\\", "/")
 
                     # Ignore tests/examples
                     if (
@@ -194,7 +201,7 @@ def expand_by_graph(
                     )
 
                     neighbor["graph_score"] = max(
-                        parent_score - 0.15,
+                        parent_score - 0.05,
                         0,
                     )
 
@@ -217,20 +224,12 @@ def expand_by_graph(
 
     result.sort(
         key=lambda c: (
-            c.get(
-                "graph_score",
-                c.get("rerank_score", c.get("score", 0.0)),
-            ),
+            int(c.get("graph_distance", 0) == 1),
+            c.get("graph_score", c.get("rerank_score", c.get("score", 0.0))),
             -c.get("graph_distance", 0),
         ),
         reverse=True,
     )
-    if result:
-        logger.debug(
-            "Graph expansion returned %d chunks; first=%s",
-            len(result),
-            result[0].get("name"),
-        )
 
     return result
 
@@ -241,24 +240,18 @@ def build_name_index(chunks):
     decorator_index = {}
 
     for chunk in chunks:
-       for decorator in chunk.get("decorators", []):
+       for decorator in chunk["decorators"]:
           decorator_index.setdefault(decorator, []).append(chunk)
 
     for chunk in chunks:
-        name = chunk["name"]
-        index.setdefault(name, []).append(chunk)
-        bare_name = _bare_symbol_name(name)
-        if bare_name != name:
-            index.setdefault(bare_name, []).append(chunk)
+
+        index.setdefault(chunk["name"], []).append(chunk)
 
         key = (
             chunk["file"],
-            name,
+            chunk["name"],
         )
 
         qualified[key] = chunk
-        # Same-file bare-name lookup resolves calls such as
-        # ``self.add_url_rule()`` to ``Scaffold.add_url_rule``.
-        qualified.setdefault((chunk["file"], bare_name), chunk)
 
     return index, qualified,decorator_index

@@ -220,68 +220,213 @@ async def rewrite_query(
     question: str,
     repo_id: str,
     redis_client,
-  ) -> dict:
+) -> dict:
+    """
+    Rewrite a user question into retrieval-oriented information.
+
+    Returns:
+    {
+        "implementation_summary": str,
+        "phrases": list[str],
+        "intent": str,
+        "graph": {
+            "direction": "callers|callees|both",
+            "depth": int,
+            "entry": str,
+        },
+    }
+    """
+
     repo_profile = await get_repo_profile(redis_client, repo_id)
+
     words = IDENTIFIER_RE.findall(question)
 
     ignore = {
-      "what", "where", "when", "why", "how",
-      "is", "are", "does", "do",
-      "the", "a", "an", "of", "to", "in",
-      "for", "about", "explain", "describe",
-      "tell", "show", "find",
+        "what", "where", "when", "why", "how",
+        "is", "are", "does", "do",
+        "the", "a", "an", "of", "to", "in",
+        "for", "about", "explain", "describe",
+        "tell", "show", "find",
     }
-    symbols = [w for w in words if w.lower() not in ignore]
+
+    symbols = [
+        w for w in words
+        if w.lower() not in ignore
+    ]
 
     symbol = symbols[0] if len(symbols) == 1 else None
+
     CODE_WORDS = {
-    "client",
-    "request",
-    "response",
-    "config",
-    "cache",
-    "builder",
-    "manager",
-    "factory",
-    "service",
-}   
-    
-    """Returns {"implementation_summary": str, "phrases": list[str], "intent": str}."""
+        "client",
+        "request",
+        "response",
+        "config",
+        "cache",
+        "builder",
+        "manager",
+        "factory",
+        "service",
+    }
+
     prompt = _PROMPT_TEMPLATE.format(
-    question=question,
-    repo_profile=repo_profile,
-)
+        question=question,
+        repo_profile=repo_profile,
+    )
+
     try:
         resp = await _llm.chat.completions.create(
-         model=settings.groq_model,
-         max_completion_tokens=300,
-         messages=[{"role": "user", "content": prompt}],
-)
-        text = resp.choices[0].message.content.strip().replace("```json", "").replace("```", "")
-        data = json.loads(text)
-        if not isinstance(data.get("phrases"), list):
-         data["phrases"] = [question]
+            model=settings.groq_model,
+            max_completion_tokens=1200,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Return ONLY one valid JSON object. "
+                        "Do not use markdown fences. "
+                        "Do not include any text outside the JSON object. "
+                        "Keep implementation_summary concise. "
+                        "Return at most 8 phrases. "
+                        "Keep graph.depth between 1 and 2."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+        )
 
-        if data.get("intent") not in {
-          "find_function",
-          "understand_flow",
-          "find_usage",
-          "debug",
-        }:
-         data["intent"] = "find_function"
-        data.setdefault("implementation_summary", question)
-        data.setdefault("phrases", [question])
-        data.setdefault("intent", "find_function")
-        return data
+        content = resp.choices[0].message.content or ""
+
+        logger.debug("HYDE RAW RESPONSE: %r", content)
+
+        if not content.strip():
+            raise ValueError("HyDE returned empty content")
+
+        data = json.loads(content)
+
+        if not isinstance(data, dict):
+            raise ValueError("HyDE response is not a JSON object")
+
     except Exception as e:
-        logger.warning(f"HyDE rewrite failed ({e}), falling back to raw query")
-        
+        logger.warning(
+            "HyDE rewrite failed (%s), falling back to raw query",
+            e,
+        )
+
         return {
-    "implementation_summary": question,
-    "phrases": question.split(),
-    "intent": "find_function",
+            "implementation_summary": question,
+            "phrases": [question],
+            "intent": "find_function",
+            "graph": {
+                "direction": "both",
+                "depth": 1,
+                "entry": symbol or "",
+            },
+        }
+
+    # ---------------------------------------------------------
+    # Validate and normalize the model response
+    # ---------------------------------------------------------
+
+    # implementation_summary
+    implementation_summary = data.get("implementation_summary")
+
+    if not isinstance(implementation_summary, str):
+        implementation_summary = question
+
+    implementation_summary = implementation_summary.strip()
+
+    if not implementation_summary:
+        implementation_summary = question
+
+    data["implementation_summary"] = implementation_summary
+
+    # phrases
+    phrases = data.get("phrases")
+
+    if not isinstance(phrases, list):
+        phrases = [question]
+
+    phrases = [
+        str(p).strip()
+        for p in phrases
+        if str(p).strip()
+    ]
+
+    if not phrases:
+        phrases = [question]
+
+    # Keep retrieval expansion bounded.
+    data["phrases"] = phrases[:8]
+
+    # intent
+    valid_intents = {
+        "find_function",
+        "understand_flow",
+        "find_usage",
+        "debug",
+    }
+
+    intent = data.get("intent")
+
+    if intent not in valid_intents:
+        intent = "find_function"
+
+    data["intent"] = intent
+
+    # ---------------------------------------------------------
+    # graph validation
+    # ---------------------------------------------------------
+
+    graph = data.get("graph")
+
+    if not isinstance(graph, dict):
+        graph = {}
+
+    direction = graph.get("direction", "both")
+
+    if direction not in {
+        "callers",
+        "callees",
+        "both",
+    }:
+        direction = "both"
+
+    depth = graph.get("depth", 1)
+
+    if not isinstance(depth, int) or isinstance(depth, bool):
+        depth = 1
+
+    # Keep graph traversal bounded.
+    depth = max(1, min(depth, 2))
+
+    entry = graph.get("entry", "")
+
+    if not isinstance(entry, str):
+        entry = ""
+
+    entry = entry.strip()
+
+    # If the model didn't provide an entry but we identified
+    # exactly one symbol from the user's question, use that.
+    if not entry and symbol:
+        entry = symbol
+
+    data["graph"] = {
+        "direction": direction,
+        "depth": depth,
+        "entry": entry,
+    }
+
+    return data
+
+
+# Intents that benefit from walking the call graph outward
+# from the top retrieved symbol.
+GRAPH_EXPAND_INTENTS = {
+    "understand_flow",
+    "find_usage",
+    "debug",
 }
-
-
-# Intents that benefit from walking the call graph outward from the top hit.
-GRAPH_EXPAND_INTENTS = {"understand_flow", "find_usage", "debug"}

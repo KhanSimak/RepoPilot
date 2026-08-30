@@ -28,11 +28,35 @@ class AgentState(TypedDict):
     reasoning_trace: list[str]
     iteration: int
 
-    next_action: Literal["retrieve", "expand_graph", "answer"] | None
+    next_action: Literal["retrieve", "expand_graph", "answer", "generate_diff"] | None
     action_query: str | None
     graph_name_index: dict | None
     graph_qualified_index: dict | None
     retrieval_exhausted: bool
 
+    # Symbols/topics the reasoning model has explicitly named (via
+    # missing_information) as still needed, accumulated across the whole
+    # run and pruned as gathered evidence comes to match them. A
+    # requirement named on one iteration can otherwise silently drop out
+    # of the model's OWN missing_information on a later call - e.g. after
+    # a structural redirect lands on an unrelated-but-well-connected
+    # symbol - even though the underlying evidence gap never closed. See
+    # reasoning_node's named-requirement gate.
+    outstanding_requirements: list[str]
+
+    # Groq token accounting for the reasoning and final-answer calls made by
+    # this loop.  The agent endpoint owns the RequestTrace, so nodes return
+    # their usage through state rather than creating a parallel trace.
+    agent_input_tokens: int
+    agent_output_tokens: int
+
     final_answer: str | None
     stop_reason: str | None
+
+    # Populated only when intent == "generate_code_change" and
+    # generate_diff_node runs. proposed_diff is a unified diff (or None
+    # if the model couldn't safely propose one) - it is NEVER applied by
+    # this node or anything in the reasoning loop. Applying it is a
+    # separate, sandboxed step outside this graph (a later phase).
+    proposed_diff: str | None
+    diff_explanation: str | None

@@ -1,4 +1,4 @@
-version: "3.9"
+
 # Full stack: the FastAPI app + Qdrant + Redis, all containerized.
 #
 # Named volumes matter here, not just for Qdrant/Redis data:
@@ -20,8 +20,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    ports:
-      - "6380:6379"
+    
     command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
     volumes:
       - redis_data:/data
@@ -49,8 +48,10 @@ services:
       - repos_data:/tmp/repos
       - hf_cache:/root/.cache/huggingface
     depends_on:
-      - qdrant
-      - redis
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
 
 volumes:
   qdrant_data:

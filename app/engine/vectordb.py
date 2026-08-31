@@ -12,6 +12,7 @@ from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import (
     Distance, VectorParams, PointStruct,
     Filter, FieldCondition, MatchValue,
+    PayloadSchemaType,
 )
 import logging
 
@@ -35,6 +36,11 @@ async def init_qdrant(cfg) -> AsyncQdrantClient:
         logger.info(f"Created Qdrant collection: {cfg.qdrant_collection}")
     else:
         logger.info(f"Qdrant collection already exists: {cfg.qdrant_collection}")
+    await client.create_payload_index(
+        collection_name=cfg.qdrant_collection,
+        field_name="repo_id",
+        field_schema=PayloadSchemaType.KEYWORD,
+    )
 
     return client
 

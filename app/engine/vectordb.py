@@ -36,11 +36,16 @@ async def init_qdrant(cfg) -> AsyncQdrantClient:
         logger.info(f"Created Qdrant collection: {cfg.qdrant_collection}")
     else:
         logger.info(f"Qdrant collection already exists: {cfg.qdrant_collection}")
-    await client.create_payload_index(
-        collection_name=cfg.qdrant_collection,
-        field_name="repo_id",
-        field_schema=PayloadSchemaType.KEYWORD,
-    )
+    try:
+        result = await client.create_payload_index(
+            collection_name=cfg.qdrant_collection,
+            field_name="repo_id",
+            field_schema=PayloadSchemaType.KEYWORD,
+        )
+        logger.info("repo_id index created: %s", result)
+    except Exception as e:
+        logger.exception("Failed to create repo_id payload index: %r", e)
+        raise
 
     return client
 

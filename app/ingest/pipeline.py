@@ -17,6 +17,7 @@ import time
 import logging
 from pathlib import Path
 import git
+import asyncio
 
 from app.models.chunk import CodeChunk
 from app.ingest.cloner import clone_repo
@@ -103,9 +104,18 @@ async def run_ingest(repo_id: str, github_url: str, branch: str, qdrant_client, 
     that gets stored as the repo's metadata.
     """
     t0 = time.perf_counter()
+    logger.info("Starting clone for %s", repo_id)
+
 
     # 1. Clone (or pull) the repo
-    local_path = clone_repo(github_url, repo_id, cfg.repos_dir, branch)
+    local_path = await asyncio.to_thread(
+        clone_repo,
+        github_url,
+        repo_id,
+        cfg.repos_dir,
+        branch,
+    )
+    logger.info("Clone finished for %s: %s", repo_id, local_path)
 
     # 2. Walk every .py file
     files = _walk_python_files(local_path)

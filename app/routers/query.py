@@ -16,7 +16,7 @@ from fastapi.responses import StreamingResponse
 
 from app.query.pipeline import run_query, stream_query, run_agentic_query
 from app.agent.graph import run_agent
-from app.routers.repos import get_registry
+from app.routers.repos import get_repo_record
 
 router = APIRouter()
 
@@ -37,13 +37,14 @@ async def ask_agent(
     Response includes `reasoning_trace` — every Thought/Action/Observation
     step, useful for seeing exactly why the agent gathered what it gathered.
     """
-    registry = get_registry()
-    if repo_id not in registry:
+    redis_client = request.app.state.redis
+    meta = await get_repo_record(repo_id, redis_client)
+    if meta is None:
         raise HTTPException(404, "Repo not found")
-    if registry[repo_id]["status"] != "done":
-        raise HTTPException(400, f"Repo not ready: {registry[repo_id]['status']}")
+    if meta["status"] != "done":
+        raise HTTPException(400, f"Repo not ready: {meta['status']}")
 
-    cfg, qdrant, redis_client = request.app.state.settings, request.app.state.qdrant, request.app.state.redis
+    cfg, qdrant = request.app.state.settings, request.app.state.qdrant
     return await run_agentic_query(question, repo_id, qdrant, redis_client, cfg)
 
 
@@ -73,13 +74,14 @@ async def generate_diff(
     from the gathered context) for you to review and apply yourself -
     applying it is a separate, sandboxed step this endpoint doesn't do.
     """
-    registry = get_registry()
-    if repo_id not in registry:
+    redis_client = request.app.state.redis
+    meta = await get_repo_record(repo_id, redis_client)
+    if meta is None:
         raise HTTPException(404, "Repo not found")
-    if registry[repo_id]["status"] != "done":
-        raise HTTPException(400, f"Repo not ready: {registry[repo_id]['status']}")
+    if meta["status"] != "done":
+        raise HTTPException(400, f"Repo not ready: {meta['status']}")
 
-    cfg, qdrant, redis_client = request.app.state.settings, request.app.state.qdrant, request.app.state.redis
+    cfg, qdrant = request.app.state.settings, request.app.state.qdrant
 
     result = await run_agent(
         question=change_request,
@@ -110,13 +112,14 @@ async def ask(
     question: str = QParam(..., min_length=3),
     top_k: int = QParam(default=5, ge=1, le=10),
 ):
-    registry = get_registry()
-    if repo_id not in registry:
+    redis_client = request.app.state.redis
+    meta = await get_repo_record(repo_id, redis_client)
+    if meta is None:
         raise HTTPException(404, "Repo not found")
-    if registry[repo_id]["status"] != "done":
-        raise HTTPException(400, f"Repo not ready: {registry[repo_id]['status']}")
+    if meta["status"] != "done":
+        raise HTTPException(400, f"Repo not ready: {meta['status']}")
 
-    cfg, qdrant, redis_client = request.app.state.settings, request.app.state.qdrant, request.app.state.redis
+    cfg, qdrant = request.app.state.settings, request.app.state.qdrant
     return await run_query(question, repo_id, qdrant, redis_client, cfg, top_k=top_k)
 
 
@@ -133,13 +136,14 @@ async def ask_stream(
       {"type":"token","text":"..."}  (repeated as tokens stream in)
       {"type":"done","trace":{...}}
     """
-    registry = get_registry()
-    if repo_id not in registry:
+    redis_client = request.app.state.redis
+    meta = await get_repo_record(repo_id, redis_client)
+    if meta is None:
         raise HTTPException(404, "Repo not found")
-    if registry[repo_id]["status"] != "done":
+    if meta["status"] != "done":
         raise HTTPException(400, "Repo not ready")
 
-    cfg, qdrant, redis_client = request.app.state.settings, request.app.state.qdrant, request.app.state.redis
+    cfg, qdrant = request.app.state.settings, request.app.state.qdrant
     return StreamingResponse(
         stream_query(question, repo_id, qdrant, redis_client, cfg, top_k=top_k),
         media_type="text/event-stream",

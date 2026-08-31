@@ -28,7 +28,7 @@ from app.cache.redis_cache import (
     get_cached_query, set_cached_query,
     get_cached_embedding, set_cached_embedding,
 )
-from app.routers.repos import get_registry
+from app.routers.repos import get_repo_record
 from app.schemas.api import SearchResponse, ChunkOut
 from app.config import get_settings
 router = APIRouter()
@@ -49,15 +49,16 @@ async def search_endpoint(
     question: str = Query(..., min_length=3, description="Your question about the codebase"),
     top_k:   int = Query(default=5, ge=1, le=20),
 ):
-    registry = get_registry()
-    if repo_id not in registry:
-        raise HTTPException(404, "Repo not found. POST /repos first.")
-    if registry[repo_id]["status"] != "done":
-        raise HTTPException(400, f"Repo not ready yet. Status: {registry[repo_id]['status']}")
-
     cfg    = request.app.state.settings
     qdrant = request.app.state.qdrant
     redis_client = request.app.state.redis
+
+    meta = await get_repo_record(repo_id, redis_client)
+    if meta is None:
+        raise HTTPException(404, "Repo not found. POST /repos first.")
+    if meta["status"] != "done":
+        raise HTTPException(400, f"Repo not ready yet. Status: {meta['status']}")
+
     t0 = time.perf_counter()
 
     # ── Layer 1 cache check — exact question, exact repo, exact top_k ──────
@@ -172,8 +173,8 @@ async def list_chunks(
     Use ?mode=vector vs ?mode=hybrid on the SAME query to see exactly what
     BM25 + RRF fusion adds (or removes) compared to vector search alone.
     """
-    registry = get_registry()
-    if repo_id not in registry:
+    meta = await get_repo_record(repo_id, request.app.state.redis)
+    if meta is None:
         raise HTTPException(404, "Repo not found")
 
     cfg    = request.app.state.settings

@@ -12,7 +12,7 @@ you'd gate on.
 
 from fastapi import APIRouter, Request, HTTPException, Query as QParam
 from app.eval.runner import run_eval
-from app.routers.repos import get_registry
+from app.routers.repos import get_repo_record
 
 router = APIRouter()
 
@@ -23,11 +23,11 @@ async def run_eval_endpoint(
     repo_id: str = QParam(...),
     max_questions: int = QParam(default=100, ge=1, le=500),
 ):
-    registry = get_registry()
-    if repo_id not in registry:
+    meta = await get_repo_record(repo_id, request.app.state.redis)
+    if meta is None:
         raise HTTPException(404, "Repo not found")
-    if registry[repo_id]["status"] != "done":
-        raise HTTPException(400, f"Repo not ready: {registry[repo_id]['status']}")
+    if meta["status"] != "done":
+        raise HTTPException(400, f"Repo not ready: {meta['status']}")
 
     cfg, qdrant = request.app.state.settings, request.app.state.qdrant
     return await run_eval(repo_id, qdrant, cfg, max_questions=max_questions)

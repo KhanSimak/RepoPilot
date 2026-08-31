@@ -12,12 +12,12 @@ from last time (the chunk's enriched embed text is identical, so the
 cache key, which is md5(text), is identical too).
 """
 
+import asyncio
 import os
 import time
 import logging
 from pathlib import Path
 import git
-import asyncio
 
 from app.models.chunk import CodeChunk
 from app.ingest.cloner import clone_repo
@@ -26,7 +26,7 @@ from app.engine.embedder import embed_batch
 from app.engine.vectordb import upsert_chunks, delete_repo
 from app.engine.bm25 import build_index
 from app.engine.call_graph import build_called_by
-from app.cache.redis_cache import batch_get_embeddings, set_cached_embedding, clear_cached_queries_for_repo
+from app.cache.redis_cache import batch_get_embeddings, set_cached_embedding
 
 logger = logging.getLogger(__name__)
 
@@ -104,18 +104,16 @@ async def run_ingest(repo_id: str, github_url: str, branch: str, qdrant_client, 
     that gets stored as the repo's metadata.
     """
     t0 = time.perf_counter()
-    logger.info("Starting clone for %s", repo_id)
 
-
-    # 1. Clone (or pull) the repo
-    local_path = await asyncio.to_thread(
-        clone_repo,
-        github_url,
-        repo_id,
-        cfg.repos_dir,
-        branch,
-    )
-    logger.info("Clone finished for %s: %s", repo_id, local_path)
+    # 1. Clone (or pull) the repo - clone_repo() is a blocking, synchronous
+    #    subprocess call (see app/ingest/cloner.py) that can legitimately
+    #    take up to CLONE_TIMEOUT_SECONDS (120s). Calling it directly here
+    #    would block THIS event loop for that entire duration - freezing
+    #    every other request this FastAPI process is serving, not just
+    #    this one ingest. asyncio.to_thread() runs it on a worker thread
+    #    instead, so the event loop stays free to serve other requests
+    #    while this clone/pull is in progress.
+    local_path = await asyncio.to_thread(clone_repo, github_url, repo_id, cfg.repos_dir, branch)
 
     # 2. Walk every .py file
     files = _walk_python_files(local_path)
@@ -174,7 +172,6 @@ async def run_ingest(repo_id: str, github_url: str, branch: str, qdrant_client, 
         for chunk, vector in zip(all_chunks, vectors)
     ]
     await upsert_chunks(qdrant_client, cfg.qdrant_collection, points)
-    await clear_cached_queries_for_repo(redis_client, repo_id)
 
     # 7. Build the BM25 keyword index for this repo
     build_index(repo_id, [{"id": c.id, "text": c.text, "name": c.name} for c in all_chunks])

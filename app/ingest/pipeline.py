@@ -238,7 +238,7 @@ MAX_FILE_SIZE_BYTES = 500_000   # skip huge generated/minified files
 # is what bounds the embed/upsert stage's peak memory. Overridable via
 # cfg.ingest_embed_batch_size for tuning against a given Render plan's
 # memory limit.
-DEFAULT_EMBED_BATCH_SIZE = 100
+DEFAULT_EMBED_BATCH_SIZE = 25
 
 # How often (in files) to log chunking progress on large repos.
 FILE_LOG_INTERVAL = 200

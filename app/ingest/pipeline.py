@@ -167,7 +167,16 @@ graph requirement):
   Everything else — the Redis cache, Qdrant upsert semantics, the BM25
   index contents/build call, the call graph algorithm, the repo
   profile algorithm, and the run_ingest return contract — is unchanged.
-"""import resource
+"""
+import asyncio
+import gc
+import os
+import time
+import logging
+from pathlib import Path
+from typing import AsyncIterator, Iterator
+import git
+import resource
 
 from app.models.chunk import CodeChunk, ChunkMeta
 from app.ingest.chunk_spool import ChunkSpool

@@ -248,8 +248,8 @@ async def embed_batch(texts: list[str]) -> list[list[float]]:
         return []
     loop = asyncio.get_event_loop()
     all_vectors: list[list[float]] = []
-    for i in range(0, len(texts), 8):
-        batch = texts[i:i + 8]
+    for i in range(0, len(texts), 2):
+        batch = texts[i:i + 2]
         vectors = await loop.run_in_executor(_executor, _encode_sync, batch)
         all_vectors.extend(vectors)
 

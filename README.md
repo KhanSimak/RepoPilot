@@ -1,281 +1,1274 @@
-# Codebase Q&A Engine — Final Phase
+# RepoPilot — Autonomous Codebase Intelligence & Coding Agent
 
-> Point at any GitHub repo. Ask a question in plain English. Get a precise, cited answer — with a full breakdown of exactly what it cost and how long every stage took.
+**RepoPilot** is an end-to-end codebase intelligence and autonomous coding system that can ingest a GitHub repository, understand its structure, answer questions with precise code citations, investigate bugs, generate code changes, test those changes, and iteratively fix failures before producing a reviewable patch.
 
-This is the **final phase** of the project, built on top of Phase 1 (AST chunking + ONNX embeddings) and Phase 2 (hybrid search + Redis caching). This phase adds everything that turns "a RAG demo" into "a system with measured, defensible engineering decisions": query rewriting, reranking, token budgeting, call-graph-aware retrieval, incremental ingestion, and a retrieval evaluation framework.
+It combines **AST-based code understanding, hybrid retrieval, call-graph reasoning, reranking, caching, incremental indexing, persistent repository memory, automated testing, evaluation, and an iterative LangGraph coding agent**.
 
-> **LLM provider: Groq, not Anthropic.** Every text-generation call (HyDE rewriting, context compression, the final answer) runs on Groq's `llama-3.1-8b-instant` instead of Claude. Groq has a genuine no-credit-card free tier (~30 requests/min, ~6,000 tokens/min, 14,400 requests/day) and is dramatically faster (~560 tokens/sec on Groq's custom LPU hardware) — you'll notice the `llm_generation` stage in the cost trace below is the FASTEST stage in the pipeline, not the slowest. Get a free key at [console.groq.com/keys](https://console.groq.com/keys). The only embedding/reranking models (ONNX + CrossEncoder) are unaffected — those were always local and free regardless of LLM provider.
+The goal is not simply to build another "chat with your code" RAG application.
 
----
+RepoPilot is designed to move from:
 
-## What's new in this phase
-
-| Capability | File | What it solves |
-|---|---|---|
-| **HyDE query rewriting + intent detection** | `app/query/rewriter.py` | Bridges the gap between English questions and code-shaped embeddings; classifies intent in the same call |
-| **Call graph (`calls` → `called_by`)** | `app/engine/call_graph.py` | Turns "find a function" into "understand a flow" by walking callers/callees |
-| **Graph-aware retrieval** | `app/query/retriever.py` | Automatically expands results outward along the call graph for flow/usage/debug questions |
-| **Cross-encoder reranking** | `app/engine/reranker.py` | Narrows 20 candidates to the true top 5, locally, for $0 |
-| **Token budget manager** | `app/engine/token_budget.py` | Compresses chunks in parallel, enforces a hard context-token cap before the LLM call |
-| **Per-stage cost/latency tracer** | `app/engine/cost_tracker.py` | Every response shows exactly what each pipeline stage cost and took |
-| **SSE streaming** | `app/query/pipeline.py`, `app/routers/query.py` | First token in ~300ms instead of waiting for the full answer |
-| **Incremental ingest** | `app/ingest/incremental.py` | git diff + content hashing — only re-embed what actually changed |
-| **Evaluation framework** | `app/eval/` | Auto-generated golden dataset, Recall@5, Recall@10, MRR, latency percentiles, per-file quality scores |
+> **Understand the repository → investigate the problem → generate a change → test the change → fix failures → produce a reviewable patch.**
 
 ---
 
-## Full architecture
+# 🚀 What It Does
 
-```
-                         POST /repos {github_url}
-                                 │
-                                 ▼
-                    clone → walk .py files → AST chunk
-                                 │
-                    build_called_by()  ◄── NEW: inverts calls into called_by
-                    across ALL chunks, once, before embedding
-                                 │
-              check embedding cache (Redis) → embed only misses (ONNX)
-                                 │
-                    upsert to Qdrant + build BM25 index
-                                 │
-                                 ▼
-                       [repo ready for queries]
+Point RepoPilot at a GitHub repository:
 
-
-                    POST /repos/{id}/ask  or  GET /repos/{id}/stream
-                                 │
-                                 ▼
-                ┌────────────────────────────────────┐
-                │ 1. L1 cache check (Redis)           │  ~1ms on hit, full pipeline skipped
-                └────────────────┬───────────────────┘
-                                 │ MISS
-                ┌────────────────▼───────────────────┐
-                │ 2. HyDE rewrite + intent detection  │  one Groq call, ~60ms
-                │    (app/query/rewriter.py)          │
-                └────────────────┬───────────────────┘
-                                 │
-                ┌────────────────▼───────────────────┐
-                │ 3. Embed HyDE snippet (L2 cache)    │  ~25ms, or ~1ms cached
-                └────────────────┬───────────────────┘
-                                 │
-                ┌────────────────▼───────────────────┐
-                │ 4. Vector search + BM25 in parallel │  ~25ms
-                │    → RRF fusion → top 20            │
-                │    → IF intent needs it: graph       │
-                │      expand via calls/called_by      │  (app/query/retriever.py)
-                └────────────────┬───────────────────┘
-                                 │
-                ┌────────────────▼───────────────────┐
-                │ 5. Cross-encoder rerank → top 5      │  ~80ms, $0
-                └────────────────┬───────────────────┘
-                                 │
-                ┌────────────────▼───────────────────┐
-                │ 6. Parallel compression + token      │  ~200ms (parallel, not 1000ms)
-                │    budget enforcement (max 500 tok)  │
-                └────────────────┬───────────────────┘
-                                 │
-                ┌────────────────▼───────────────────┐
-                │ 7. Final LLM call — Groq (llama-3.1-8b-instant), streamed  │  ~300ms to first token
-                └────────────────┬───────────────────┘
-                                 │
-                       cache result + return trace
-
-
-                    POST /repos/{id}/sync   (incremental re-ingest)
-                                 │
-                                 ▼
-                git pull → git diff(last_commit, HEAD) → changed files only
-                                 │
-                re-chunk changed files → compare content_hash vs stored
-                                 │
-                embed ONLY chunks whose body actually changed
-                                 │
-                rebuild call graph (whole repo, in-memory, cheap)
-                                 │
-                rebuild BM25 index (whole repo, in-memory, cheap)
-
-
-                    POST /eval/run?repo_id=...
-                                 │
-                                 ▼
-                auto-generate golden Q&A from docstrings
-                                 │
-                run hybrid retrieval for each question, record rank found
-                                 │
-                compute Recall@5, Recall@10, MRR, latency P50/P95/P99,
-                worst-performing files (sorted by recall, ascending)
+```text
+                    GitHub Repository
+                           │
+                           ▼
+                      AST Parsing
+                           │
+                  ┌────────┴────────┐
+                  │                 │
+                  ▼                 ▼
+             Code Chunks       Call Graph
+                  │                 │
+                  └────────┬────────┘
+                           ▼
+                    Repository Index
+                     │            │
+                     ▼            ▼
+                   Qdrant        BM25
+                     │            │
+                     └─────┬──────┘
+                           ▼
+                    Hybrid Retrieval
+                           │
+                           ▼
+                       RRF Fusion
+                           │
+                           ▼
+                    Graph Expansion
+                           │
+                           ▼
+                      Reranking
+                           │
+                           ▼
+                  Context Compression
+                           │
+                           ▼
+                    LLM / Agent
+                           │
+             ┌─────────────┴─────────────┐
+             ▼                           ▼
+       Grounded Answer             Coding Agent
+                                         │
+                                         ▼
+                                   Generate Patch
+                                         │
+                                         ▼
+                                   Git Worktree
+                                         │
+                                         ▼
+                                   Run Tests
+                                         │
+                              ┌──────────┴──────────┐
+                              │                     │
+                           PASS                  FAIL
+                              │                     │
+                              ▼                     ▼
+                       Reviewable Patch       Investigate
+                                                    │
+                                                    ▼
+                                               Fix Code
+                                                    │
+                                                    ▼
+                                               Run Tests
+                                                    │
+                                                    └───►
 ```
 
 ---
 
-## Project structure (final phase)
+# ✨ Core Capabilities
 
+## 1. Codebase Q&A
+
+Users can ask natural-language questions about an entire repository:
+
+```text
+How does connection pooling work?
+
+Where is authentication implemented?
+
+What calls the create_user function?
+
+Why does this request timeout?
+
+Trace the request from the API endpoint to the database.
+
+Where is this configuration value used?
 ```
-codebase-qa-phase4/
-├── app/
-│   ├── main.py                   # loads embedder, reranker, qdrant, redis at startup
-│   ├── config.py
-│   │
-│   ├── models/
-│   │   └── chunk.py               # CodeChunk — now includes called_by
-│   │
-│   ├── schemas/
-│   │   └── api.py
-│   │
-│   ├── engine/
-│   │   ├── ast_chunker.py         # unchanged from Phase 1 — extracts calls
-│   │   ├── embedder.py            # unchanged from Phase 1 — ONNX, $0/query
-│   │   ├── vectordb.py            # + retrieve_by_ids, scroll_repo_chunks
-│   │   ├── bm25.py                # unchanged from Phase 2
-│   │   ├── fusion.py              # unchanged from Phase 2 — RRF
-│   │   ├── call_graph.py          # NEW — build_called_by, expand_by_graph
-│   │   ├── reranker.py            # NEW — CrossEncoder, local, $0
-│   │   ├── token_budget.py        # NEW — counting, compression, budget cap
-│   │   └── cost_tracker.py        # NEW — StageTimer, RequestTrace
-│   │
-│   ├── cache/
-│   │   └── redis_cache.py         # unchanged from Phase 2 — two-layer cache
-│   │
-│   ├── query/                     # NEW module
-│   │   ├── rewriter.py            # HyDE + intent detection (one call)
-│   │   ├── retriever.py           # hybrid search + optional graph expand
-│   │   └── pipeline.py            # full orchestrator: run_query + stream_query
-│   │
-│   ├── ingest/
-│   │   ├── cloner.py              # unchanged from Phase 1
-│   │   ├── pipeline.py            # + call graph build, + commit hash tracking
-│   │   └── incremental.py         # NEW — git diff + content hash re-ingest
-│   │
-│   ├── eval/                      # NEW module
-│   │   ├── golden_dataset.py      # auto Q&A generation from docstrings
-│   │   ├── metrics.py             # Recall@K, MRR, latency percentiles
-│   │   └── runner.py              # runs the benchmark end to end
-│   │
-│   └── routers/
-│       ├── repos.py               # + POST /repos/{id}/sync
-│       ├── search.py               # unchanged — Phase 2 baseline, kept for comparison
-│       ├── query.py                # NEW — /ask and /stream (the final pipeline)
-│       ├── stats.py                # unchanged
-│       └── eval.py                 # NEW — POST /eval/run
-│
-├── tests/
-│   ├── test_chunker.py
-│   ├── test_hybrid_search.py
-│   ├── test_call_graph.py          # NEW
-│   └── test_eval_metrics.py        # NEW
-│
-├── docker-compose.yml               # Qdrant + Redis — no new infra this phase
-├── Dockerfile
-├── requirements.txt
-└── .env.example
+
+RepoPilot retrieves the relevant code and produces an answer grounded in the repository.
+
+Responses can include:
+
+* file paths
+* line ranges
+* symbols
+* retrieved source context
+* retrieval scores
+* pipeline latency
+* cache information
+
+---
+
+# 2. Hybrid Code Retrieval
+
+RepoPilot combines multiple retrieval strategies:
+
+```text
+                 User Question
+                       │
+             ┌─────────┴─────────┐
+             ▼                   ▼
+       Vector Search          BM25 Search
+             │                   │
+             └─────────┬─────────┘
+                       ▼
+                  RRF Fusion
+                       │
+                       ▼
+                Candidate Chunks
+                       │
+                       ▼
+                 Reranker
+                       │
+                       ▼
+                 Top Context
+```
+
+The retrieval layer uses:
+
+* AST-aware chunking
+* dense vector retrieval
+* BM25 lexical search
+* Reciprocal Rank Fusion
+* reranking
+* call-graph expansion
+
+### Why both vector and BM25?
+
+Vector retrieval is useful for semantic questions:
+
+```text
+"How does authentication happen?"
+```
+
+BM25 is particularly useful for exact code concepts:
+
+```text
+ConnectionPool
+create_user
+JWT_SECRET
+/api/login
+TimeoutError
+```
+
+Combining both makes retrieval more robust across different question types.
+
+---
+
+# 3. AST-Based Code Understanding
+
+Instead of blindly splitting source code by character count, RepoPilot parses Python code using the AST.
+
+This allows it to preserve logical structures such as:
+
+```text
+Class
+ ├── method
+ ├── method
+ └── method
+```
+
+rather than producing arbitrary text fragments.
+
+AST extraction also identifies function calls that can later be used to build the repository's call graph.
+
+---
+
+# 4. Call-Graph-Aware Retrieval
+
+RepoPilot builds relationships between functions and methods.
+
+For example:
+
+```text
+POST /users
+     │
+     ▼
+create_user()
+     │
+     ▼
+validate_user()
+     │
+     ▼
+get_existing_user()
+     │
+     ▼
+database.query()
+```
+
+This becomes particularly useful for questions such as:
+
+```text
+How does user creation work end-to-end?
+
+Why does this API endpoint fail?
+
+What functions depend on this function?
+
+Where is this function being called?
+```
+
+For flow-oriented queries, the retriever can expand outward through callers and callees.
+
+### Intent-gated graph expansion
+
+Not every question needs graph traversal.
+
+For example:
+
+```text
+"Where is create_user defined?"
+```
+
+usually requires one precise chunk.
+
+Whereas:
+
+```text
+"How does create_user work end-to-end?"
+```
+
+benefits from retrieving related functions.
+
+RepoPilot therefore uses query intent to decide when graph expansion is useful.
+
+---
+
+# 5. Autonomous Coding Agent
+
+The Q&A system is extended into an iterative coding agent using **LangGraph**.
+
+The agent does not immediately generate code when given a bug report.
+
+Instead, it follows an investigation loop:
+
+```text
+                  User Request
+                       │
+                       ▼
+                  Understand
+                   Problem
+                       │
+                       ▼
+                 Retrieve Code
+                       │
+                       ▼
+                Inspect Call Graph
+                       │
+                       ▼
+               Retrieve History
+                       │
+                       ▼
+              Gather Evidence
+                       │
+                       ▼
+              Evidence Sufficient?
+                  /          \
+                No            Yes
+                │              │
+                ▼              ▼
+          Investigate       Generate
+             Again           Patch
+                               │
+                               ▼
+                         Apply in Git
+                          Worktree
+                               │
+                               ▼
+                          Run Tests
+                               │
+                    ┌──────────┴──────────┐
+                    │                     │
+                   PASS                  FAIL
+                    │                     │
+                    ▼                     ▼
+              Inspect Result        Analyze Failure
+                    │                     │
+                    ▼                     ▼
+             Reviewable Patch        Modify Code
+                                          │
+                                          ▼
+                                      Run Tests
+                                          │
+                                          └──────►
+```
+
+The important difference is that **code generation is only one step in the process**.
+
+The agent must validate what it generated.
+
+---
+
+# 🧪 6. Agent-Driven Testing & Self-Correction
+
+A generated patch is not considered successful simply because the LLM produced syntactically valid code.
+
+RepoPilot can apply the proposed changes inside an isolated Git worktree and run the repository's tests.
+
+The workflow is:
+
+```text
+Generate Code
+     │
+     ▼
+Apply Patch
+     │
+     ▼
+Run Test Suite
+     │
+     ▼
+┌───────────────┐
+│ Test Results  │
+└───────┬───────┘
+        │
+   ┌────┴────┐
+   │         │
+ PASS       FAIL
+   │         │
+   ▼         ▼
+Continue   Inspect
+             │
+             ▼
+        Error / Failure
+             │
+             ▼
+       Retrieve Relevant
+            Code
+             │
+             ▼
+       Modify Generated
+             Code
+             │
+             ▼
+          Re-test
+             │
+             └──────────►
+```
+
+This means the agent can encounter:
+
+```text
+pytest
+  ↓
+3 tests failed
+  ↓
+Agent reads failures
+  ↓
+Finds affected implementation
+  ↓
+Updates patch
+  ↓
+pytest
+  ↓
+1 test failed
+  ↓
+Agent investigates again
+  ↓
+Updates patch
+  ↓
+pytest
+  ↓
+All tests passed
+```
+
+The important property is that **test failures become evidence for the next reasoning iteration**.
+
+The agent does not simply generate one answer and stop.
+
+---
+
+# 🔐 7. Isolated Code Changes
+
+Generated code is never directly committed to the main repository.
+
+The coding agent works inside an isolated Git worktree:
+
+```text
+Main Repository
+      │
+      ├──────────────► Agent Worktree
+      │                       │
+      │                       ▼
+      │                  Apply Patch
+      │                       │
+      │                       ▼
+      │                   Run Tests
+      │                       │
+      │                       ▼
+      │                  Agent Iterates
+      │                       │
+      │                       ▼
+      │                 Final Diff
+      │
+      └──────────────────────────────►
+                         Human Review
+```
+
+The final output is a reviewable diff.
+
+The human remains responsible for deciding whether the change should actually be committed or merged.
+
+---
+
+# 🧠 8. Persistent Repository Memory
+
+One of the major extensions beyond ordinary codebase RAG is **repository-scoped persistent memory**.
+
+The agent can remember relevant information from previous investigations and coding sessions.
+
+For example:
+
+```text
+Repository: payment-service
+
+Previous Investigation:
+"Payment requests were timing out because the HTTP connection
+pool was exhausted."
+
+Previous Change:
+"Increased connection pool timeout and added retry handling."
+
+Previous Test Result:
+"Added regression test for connection pool exhaustion."
+
+Current Request:
+"Payment requests are timing out again."
+```
+
+Instead of starting from zero, the agent can retrieve the relevant previous investigation.
+
+---
+
+## Memory is not the source of truth
+
+Persistent memory is deliberately treated as **historical context**, not authoritative repository state.
+
+The hierarchy is:
+
+```text
+Current Repository Code
+        │
+        ▼
+Current Runtime / Test Evidence
+        │
+        ▼
+Current Investigation
+        │
+        ▼
+Relevant Historical Memory
+```
+
+If memory says:
+
+```text
+"function X uses Redis"
+```
+
+but the current repository shows:
+
+```text
+function X uses PostgreSQL
+```
+
+the current repository wins.
+
+This prevents stale historical information from overriding the actual code.
+
+---
+
+# 🎯 Repository-Scoped Memory
+
+Memory is scoped to a repository rather than being a generic global conversation history.
+
+Example:
+
+```text
+Repository A
+ ├── Investigation 1
+ ├── Investigation 2
+ └── Previous changes
+
+Repository B
+ ├── Investigation 1
+ └── Previous changes
+```
+
+When working on Repository A, the agent retrieves only relevant historical context from Repository A.
+
+This prevents unrelated project history from contaminating the investigation.
+
+---
+
+# 🔎 Selective Memory Retrieval
+
+The agent does not inject every previous conversation into the prompt.
+
+Instead:
+
+```text
+New Request
+     │
+     ▼
+Memory Retrieval
+     │
+     ▼
+Relevant Previous Runs
+     │
+     ▼
+Top 1–3 Memories
+     │
+     ▼
+Current Investigation
+```
+
+This keeps the context small while still allowing the agent to benefit from previous work.
+
+The current repository remains the source of truth.
+
+---
+
+# 🔄 Complete Coding-Agent Loop
+
+Putting retrieval, memory, reasoning, code generation, and testing together:
+
+```text
+                    USER REQUEST
+                         │
+                         ▼
+                  Query / Intent
+                     Analysis
+                         │
+          ┌──────────────┴──────────────┐
+          ▼                             ▼
+   Repository Retrieval          Memory Retrieval
+          │                             │
+          └──────────────┬──────────────┘
+                         ▼
+                  Evidence Gathering
+                         │
+                         ▼
+                  Call Graph Analysis
+                         │
+                         ▼
+                 Evidence Sufficient?
+                    /           \
+                  No             Yes
+                  │               │
+                  ▼               ▼
+             Investigate       Generate
+                Again            Patch
+                                  │
+                                  ▼
+                           Isolated Worktree
+                                  │
+                                  ▼
+                              Run Tests
+                                  │
+                         ┌────────┴────────┐
+                         │                 │
+                       PASS              FAIL
+                         │                 │
+                         ▼                 ▼
+                   Inspect Diff       Analyze Failure
+                         │                 │
+                         │                 ▼
+                         │            Retrieve Code
+                         │                 │
+                         │                 ▼
+                         │            Fix Patch
+                         │                 │
+                         │                 ▼
+                         │             Run Tests
+                         │                 │
+                         │                 └──────►
+                         ▼
+                  Final Reviewable
+                       Change
+```
+
+This is the core of the autonomous coding portion of RepoPilot.
+
+---
+
+# ⚡ 9. Retrieval Pipeline
+
+The production query pipeline is:
+
+```text
+User Question
+     │
+     ▼
+L1 Redis Cache
+     │
+     ├── HIT ───────────────► Cached Response
+     │
+     ▼ MISS
+HyDE Query Rewriting
++
+Intent Detection
+     │
+     ▼
+Embedding
+     │
+     ▼
+┌───────────────┬───────────────┐
+│ Vector Search │   BM25 Search │
+└───────┬───────┴───────┬───────┘
+        │               │
+        └───────┬───────┘
+                ▼
+           RRF Fusion
+                │
+                ▼
+         Top 20 Candidates
+                │
+                ▼
+        Intent-Gated Graph
+             Expansion
+                │
+                ▼
+       Cross-Encoder / API
+             Reranking
+                │
+                ▼
+             Top 5
+                │
+                ▼
+       Context Compression
+                │
+                ▼
+           Token Budget
+                │
+                ▼
+              LLM
+                │
+                ▼
+          Grounded Answer
 ```
 
 ---
 
-## Using the API
+# 🗃️ 10. Incremental Repository Ingestion
 
-### Ingest a repo (same as Phase 1/2)
-```bash
-curl -X POST http://localhost:8000/repos \
-  -H "Content-Type: application/json" \
-  -d '{"github_url": "https://github.com/encode/httpx", "branch": "master"}'
+RepoPilot avoids reprocessing an entire repository whenever a small change occurs.
+
+The synchronization pipeline is:
+
+```text
+git diff
+   │
+   ▼
+Changed Files
+   │
+   ▼
+AST Re-chunk
+   │
+   ▼
+Content Hash Comparison
+   │
+   ├── Unchanged → Skip
+   │
+   └── Changed → Re-embed
 ```
 
-### Ask with the full pipeline
-```bash
-curl -X POST "http://localhost:8000/repos/a1b2c3d4/ask?question=how+does+connection+pooling+work&top_k=5"
-```
+For example:
+
 ```json
 {
-  "question": "how does connection pooling work",
-  "answer": "Connection pooling is implemented in the ConnectionPool class (httpx/_transports/default.py)...",
-  "rewritten_query": "class ConnectionPool:\n    def acquire(self):\n        ...",
-  "intent": "understand_flow",
-  "sources": [
-    {"name": "ConnectionPool", "type": "class", "file": "httpx/_transports/default.py", "line_start": 45, "line_end": 89, "score": 7.21}
-  ],
-  "cache_hit": false,
-  "trace": {
-    "total_latency_ms": 410.8,
-    "total_cost_usd": 0.000125,
-    "cache_hits": [],
-    "stages": [
-      {"stage": "query_cache_l1", "latency_ms": 0.4, "cost_usd": 0.0, "cache_hit": false},
-      {"stage": "hyde_rewrite", "latency_ms": 31.4, "cost_usd": 0.000016},
-      {"stage": "hybrid_retrieval_graph_expanded", "latency_ms": 41.7, "cost_usd": 0.0},
-      {"stage": "reranker", "latency_ms": 79.3, "cost_usd": 0.0},
-      {"stage": "context_compression", "latency_ms": 142.3, "cost_usd": 0.000065},
-      {"stage": "llm_generation", "latency_ms": 96.7, "cost_usd": 0.000044}
-    ]
+  "status": "done",
+  "mode": "incremental",
+  "changed_files": 3,
+  "embedded_chunks": 11,
+  "skipped_chunks": 847,
+  "total_chunks": 858
+}
+```
+
+Only the chunks whose actual content changed need to be re-embedded.
+
+---
+
+# 📊 11. Retrieval Evaluation
+
+The project includes an evaluation framework instead of relying purely on manual testing.
+
+It measures:
+
+* Recall@5
+* Recall@10
+* MRR
+* P50 latency
+* P95 latency
+* P99 latency
+* Per-file retrieval quality
+
+Example:
+
+```json
+{
+  "questions_run": 87,
+  "recall_at_5": 0.839,
+  "recall_at_10": 0.908,
+  "mrr": 0.701,
+  "latency_ms": {
+    "p50": 38.2,
+    "p95": 71.4,
+    "p99": 95.0
   }
 }
 ```
 
-Notice `intent: "understand_flow"` triggered `hybrid_retrieval_graph_expanded` — the call graph walk happened automatically because the question asked "how does X work," not "find function X."
+The retrieval benchmark isolates retrieval quality from the much harder problem of judging free-form LLM answers.
 
-### Stream the same question
-```bash
-curl -N "http://localhost:8000/repos/a1b2c3d4/stream?question=how+does+connection+pooling+work"
-```
-Emits `sources` immediately, then `token` events as the answer is generated, then `done` with the full trace.
+---
 
-### Incremental sync after a code change
-```bash
-curl -X POST http://localhost:8000/repos/a1b2c3d4/sync
+# 🧩 12. Architecture
+
+```text
+app/
+├── main.py
+├── config.py
+│
+├── models/
+│   └── chunk.py
+│
+├── schemas/
+│   └── api.py
+│
+├── engine/
+│   ├── ast_chunker.py
+│   ├── embedder.py
+│   ├── vectordb.py
+│   ├── bm25.py
+│   ├── fusion.py
+│   ├── call_graph.py
+│   ├── reranker.py
+│   ├── token_budget.py
+│   └── cost_tracker.py
+│
+├── cache/
+│   └── redis_cache.py
+│
+├── memory/
+│   └── repository_memory.py
+│
+├── agent/
+│   ├── graph.py
+│   ├── investigator.py
+│   ├── coder.py
+│   ├── tester.py
+│   └── worktree.py
+│
+├── query/
+│   ├── rewriter.py
+│   ├── retriever.py
+│   └── pipeline.py
+│
+├── ingest/
+│   ├── cloner.py
+│   ├── pipeline.py
+│   └── incremental.py
+│
+├── eval/
+│   ├── golden_dataset.py
+│   ├── metrics.py
+│   └── runner.py
+│
+└── routers/
+    ├── repos.py
+    ├── search.py
+    ├── query.py
+    ├── agent.py
+    ├── stats.py
+    └── eval.py
 ```
+
+---
+
+# 🛠️ Tech Stack
+
+| Category              | Technology                         |
+| --------------------- | ---------------------------------- |
+| Language              | Python                             |
+| API                   | FastAPI                            |
+| Agent orchestration   | LangGraph                          |
+| Vector database       | Qdrant                             |
+| Cache / memory        | Redis                              |
+| LLM inference         | Groq / OpenRouter                  |
+| Embeddings            | ONNX Runtime                       |
+| Lexical retrieval     | BM25                               |
+| Reranking             | Cohere Rerank                      |
+| Code understanding    | Python AST                         |
+| Retrieval fusion      | Reciprocal Rank Fusion             |
+| Repository operations | GitPython                          |
+| Code isolation        | Git Worktrees                      |
+| Streaming             | Server-Sent Events                 |
+| Evaluation            | Recall@K, MRR, latency percentiles |
+| Deployment            | Docker                             |
+
+---
+
+# ⚙️ Engineering Decisions
+
+## Why AST chunking?
+
+Traditional RAG systems often split code by character count.
+
+That can break logical structures across chunk boundaries.
+
+AST-based chunking instead preserves functions, classes, and other meaningful code structures.
+
+---
+
+## Why BM25 + Vector Search?
+
+Vector retrieval handles semantic similarity.
+
+BM25 handles exact code vocabulary.
+
+Together they cover:
+
+```text
+Semantic questions
+       +
+Exact symbols
+       +
+Error messages
+       +
+Configuration keys
+       +
+API routes
+```
+
+---
+
+## Why RRF?
+
+Vector search and BM25 produce independent rankings.
+
+Reciprocal Rank Fusion combines those rankings without requiring their raw scores to be directly comparable.
+
+---
+
+## Why reranking?
+
+Initial retrieval optimizes for recall.
+
+Reranking improves precision by evaluating:
+
+```text
+Question ↔ Candidate Code
+```
+
+and selecting the strongest candidates for the final context.
+
+---
+
+## Why graph expansion only for certain queries?
+
+Graph traversal can add useful context but can also introduce irrelevant code.
+
+Therefore it is enabled for intents such as:
+
+```text
+understand_flow
+find_usage
+debug
+```
+
+while precise lookup queries can avoid unnecessary expansion.
+
+---
+
+## Why content hashes?
+
+A modified file does not necessarily mean every function inside that file changed.
+
+Chunk-level content hashes allow the system to determine which actual code units changed.
+
+---
+
+# 🧠 Why Persistent Memory?
+
+Normal RAG answers questions using the current repository.
+
+RepoPilot's coding agent additionally needs to understand **what happened previously**.
+
+For example:
+
+```text
+Day 1:
+Agent investigates timeout.
+
+Day 2:
+Agent adds a regression test.
+
+Day 10:
+Another timeout appears.
+
+Day 10 agent:
+"Have we seen this failure before?"
+        │
+        ▼
+Retrieve relevant repository memory
+        │
+        ▼
+Use it as historical evidence
+        │
+        ▼
+Verify against current code
+        │
+        ▼
+Continue investigation
+```
+
+This makes the agent less repetitive across multiple coding sessions while maintaining the current repository as the authority.
+
+---
+
+# 🧪 Why Testing Is Part of the Agent
+
+A coding LLM can produce code that:
+
+* looks reasonable
+* compiles
+* passes a superficial inspection
+* but breaks existing behavior
+
+RepoPilot therefore treats test execution as another source of evidence.
+
+```text
+LLM says:
+"This patch should fix the bug."
+
+        ↓
+
+Agent does NOT assume it is correct.
+
+        ↓
+
+Run tests.
+
+        ↓
+
+Tests fail.
+
+        ↓
+
+Failure becomes new evidence.
+
+        ↓
+
+Agent investigates and modifies patch.
+
+        ↓
+
+Run tests again.
+```
+
+This creates a closed-loop coding process rather than a one-shot code-generation system.
+
+---
+
+# 🔐 Safety Model
+
+The coding agent follows several safety principles:
+
+### Current repository is authoritative
+
+Historical memory cannot override current source code.
+
+### Evidence before modification
+
+The agent investigates before generating a patch.
+
+### Isolated execution
+
+Changes are applied inside a separate Git worktree.
+
+### Tests before completion
+
+A patch is not treated as successful simply because it was generated.
+
+### Human review before commit
+
+The final diff remains reviewable before it enters the main repository.
+
+---
+
+# 🌊 Streaming
+
+The API supports Server-Sent Events.
+
+Instead of waiting for the entire response:
+
+```text
+Request
+  │
+  ▼
+Sources
+  │
+  ▼
+Token
+  │
+  ▼
+Token
+  │
+  ▼
+Token
+  │
+  ▼
+Done + Trace
+```
+
+This allows clients to display the answer progressively.
+
+---
+
+# 🔌 API
+
+## Ingest a repository
+
+```bash
+curl -X POST http://localhost:8000/repos \
+  -H "Content-Type: application/json" \
+  -d '{"github_url":"https://github.com/encode/httpx","branch":"master"}'
+```
+
+---
+
+## Ask a question
+
+```bash
+curl -X POST \
+"http://localhost:8000/repos/a1b2c3d4/ask?question=how+does+connection+pooling+work&top_k=5"
+```
+
+Example:
+
 ```json
 {
-  "status": "done", "mode": "incremental",
-  "changed_files": 3, "embedded_chunks": 11,
-  "skipped_chunks": 847, "total_chunks": 858,
-  "new_commit": "a3f9c21..."
-}
-```
-847 chunks were untouched and skipped entirely — only 11 actually needed re-embedding.
-
-### Run the evaluation benchmark
-```bash
-curl -X POST "http://localhost:8000/eval/run?repo_id=a1b2c3d4&max_questions=100"
-```
-```json
-{
-  "repo_id": "a1b2c3d4", "questions_run": 87,
-  "recall_at_5": 0.839, "recall_at_10": 0.908, "mrr": 0.701,
-  "latency_ms": {"p50": 38.2, "p95": 71.4, "p99": 95.0},
-  "worst_files": [
-    {"file": "httpx/_legacy/old_client.py", "recall": 0.33, "question_count": 3}
+  "question": "how does connection pooling work",
+  "answer": "Connection pooling is implemented in the ConnectionPool class...",
+  "rewritten_query": "class ConnectionPool...",
+  "intent": "understand_flow",
+  "sources": [
+    {
+      "name": "ConnectionPool",
+      "type": "class",
+      "file": "httpx/_transports/default.py",
+      "line_start": 45,
+      "line_end": 89,
+      "score": 7.21
+    }
   ]
 }
 ```
 
 ---
 
-## Design decisions and the reasoning behind each
+## Stream an answer
 
-**Why fold intent detection into the same call as HyDE instead of a separate classification call?**
-A separate call would cost another ~150ms and another paid round trip for a single classification token. Since we already pay for one Groq call to generate the HyDE snippet, asking it to also return `intent` in the same JSON response is effectively free — zero extra latency, zero extra cost.
-
-**Why is the call graph "approximately right" rather than fully accurate?**
-`calls` is extracted from bare AST `Call` nodes — `self._get_user(x)` is recorded as `"_get_user"`, not as a fully-qualified symbol. Inverting this means two unrelated classes that both define a method called `save()` get treated as the same callee. True symbol resolution needs a real type checker (Jedi, an LSP server, or a full compiler frontend) — out of scope here. For RAG retrieval, an approximately-right call graph still meaningfully improves flow-style answers; it doesn't need compiler-grade precision to be useful, and the code says so honestly rather than overclaiming.
-
-**Why does graph expansion only trigger for certain intents, not every query?**
-`find_function` queries ("where is X defined") are usually well-served by one precise chunk — expanding the graph would dilute the context with tangentially related code and cost more tokens for no benefit. `understand_flow`, `find_usage`, and `debug` genuinely need the surrounding context. Gating the expensive operation (a full-repo scroll + BFS) behind intent detection means you only pay for it when it actually helps.
-
-**Why benchmark hybrid retrieval alone in the eval framework, skipping HyDE/rerank/LLM?**
-Evaluating the final LLM-generated answer's correctness is a much harder, fuzzier problem requiring an LLM-as-judge or human review. Recall@K and MRR on retrieval are objective, fast, and cheap to compute repeatedly — and they isolate the part of the pipeline that's most likely to silently regress (a chunking or indexing change). If the right chunk never reaches the LLM, no amount of prompt engineering fixes the answer; this is the metric that catches that failure mode early.
-
-**Why content-hash comparison instead of just trusting git diff's file-level change?**
-A file showing up in `git diff` doesn't mean every function in it changed — maybe only a docstring elsewhere in the file changed, or a comment was added. Content-hashing at the CHUNK level (not the file level) means we only pay the ONNX embedding cost for functions whose actual body changed, even within a file that technically shows up as "modified."
-
-**Why is the eval framework's golden dataset auto-generated instead of hand-labeled?**
-Hand-labeling a benchmark is slow enough that most projects skip evaluation entirely — which is why most RAG systems can only claim "it seems to work." Every chunk with a docstring is a self-labeling question: "What does `{name}` do?" with the chunk itself as ground truth. This isn't a substitute for a curated production eval set, but it requires zero manual effort and degrades honestly — a repo with poor docstring coverage gets an honest "not enough data" message rather than a misleading score.
+```bash
+curl -N \
+"http://localhost:8000/repos/a1b2c3d4/stream?question=how+does+connection+pooling+work"
+```
 
 ---
 
-## What to try once it's running
+## Synchronize a repository
 
-1. Ask the same question via `/search` (Phase 2 baseline) and `/ask` (final pipeline). Compare the `sources` returned and the latency — this is your evidence for what HyDE + reranking actually changed.
-2. Ask a "how does X work end-to-end" question and inspect the trace's stage name — confirm it says `hybrid_retrieval_graph_expanded`, then check whether the returned sources include both an entry point and its immediate callees/callers.
-3. Make a small code change in your test repo, commit it, hit `/sync`, and compare `embedded_chunks` vs `skipped_chunks` — this is the proof that incremental ingest is doing real work.
-4. Run `/eval/run` once right after ingest, note the `recall_at_5`. Deliberately make chunking worse (e.g. temporarily strip docstrings from a few functions) and run it again — watch the number move. This is what makes "we measured it" a true statement instead of a slogan.
+```bash
+curl -X POST \
+http://localhost:8000/repos/a1b2c3d4/sync
+```
+
+---
+
+## Run evaluation
+
+```bash
+curl -X POST \
+"http://localhost:8000/eval/run?repo_id=a1b2c3d4&max_questions=100"
+```
+
+---
+
+# 🐳 Running Locally
+
+Start Qdrant and Redis:
+
+```bash
+docker compose up -d
+```
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Start the API:
+
+```bash
+uvicorn app.main:app --reload --port 8000
+```
+
+The API will be available at:
+
+```text
+http://localhost:8000
+```
+
+---
+
+# 📁 Project Evolution
+
+RepoPilot evolved through several stages:
+
+```text
+Phase 1
+AST Code Chunking
+      │
+      ▼
+Phase 2
+Vector + BM25 Hybrid Retrieval
+      │
+      ▼
+Phase 3
+Caching + Query Optimization
+      │
+      ▼
+Phase 4
+HyDE + Reranking + Call Graph
+      │
+      ▼
+Phase 5
+Incremental Ingestion + Evaluation
+      │
+      ▼
+Phase 6
+LangGraph Autonomous Coding Agent
+      │
+      ▼
+Phase 7
+Persistent Repository Memory
+      │
+      ▼
+Phase 8
+Automated Testing + Self-Correction
+```
+
+The architecture therefore evolved from a basic code search/RAG system into an agent capable of investigating and modifying a repository.
+
+---
+
+# 🎯 Design Philosophy
+
+RepoPilot follows several principles.
+
+### 1. Retrieval before generation
+
+If the relevant code is not retrieved, the LLM should not be expected to know it.
+
+### 2. Evidence before action
+
+The coding agent investigates before proposing a modification.
+
+### 3. Tests are evidence
+
+A test failure is not simply an error — it is information the agent can use to continue its investigation.
+
+### 4. Memory is contextual, not authoritative
+
+Historical information helps the agent, but current repository state always wins.
+
+### 5. Human review before commit
+
+The agent can investigate, generate, test, and refine changes, but the final change remains reviewable before being committed.
+
+### 6. Measure instead of assuming
+
+Retrieval quality and latency are benchmarked explicitly.
+
+### 7. Optimize where it matters
+
+Caching, incremental ingestion, graph expansion, and reranking are used to improve real pipeline behavior rather than simply adding components for complexity.
+
+---
+
+# 🔮 Future Directions
+
+Potential extensions include:
+
+* multi-language AST support
+* compiler/LSP-backed symbol resolution
+* stronger test-aware patch validation
+* automated test generation
+* dependency graph reasoning
+* security-aware code review
+* stronger agent verification loops
+* production observability integration
+* richer long-term repository memory
+* end-to-end coding-agent evaluation benchmarks
+
+---
+
+# 📌 Project Goal
+
+RepoPilot aims to bridge the gap between **codebase RAG** and **autonomous software engineering**.
+
+The system combines:
+
+```text
+Code Understanding
+        +
+Hybrid Retrieval
+        +
+Call-Graph Reasoning
+        +
+Persistent Repository Memory
+        +
+Agentic Investigation
+        +
+Code Generation
+        +
+Automated Testing
+        +
+Self-Correction
+        +
+Safe Code Isolation
+        +
+Human Review
+```
+
+The resulting workflow is:
+
+> **Ask about the code → investigate the repository → use relevant historical context → gather evidence → generate a change → run tests → analyze failures → fix the change → retest → return a reviewable patch.**
+
+That is the central idea behind RepoPilot: **an AI coding agent that does not stop at generating code, but investigates, validates, and iterates against the actual repository.**
+
+---
+
+## License
+
+MIT

@@ -59,6 +59,17 @@ class CodeChunk:
         """Hash of the raw code — lets us detect if a function's body actually changed."""
         return hashlib.md5(source.encode()).hexdigest()
 
+    def to_meta(self) -> "ChunkMeta":
+        """Project this chunk down to the lightweight fields ChunkMeta needs."""
+        return ChunkMeta(
+            id=self.id,
+            name=self.name,
+            type=self.type,
+            file=self.file,
+            calls=self.calls,
+            imports=self.imports,
+        )
+
     def to_payload(self) -> dict:
         """Everything we store in Qdrant alongside the vector."""
         return {
@@ -83,3 +94,42 @@ class CodeChunk:
             "raw_source":  self.raw_source,
             "content_hash": self.content_hash(self.raw_source),
         }
+
+
+@dataclass
+class ChunkMeta:
+    """
+    The lightweight, repo-global-resident companion to CodeChunk.
+
+    PHASE 2.3 (fixes the OOM that survived Phase 2.1/2.2 — see the
+    "Phase 2.3" section of app/ingest/pipeline.py's module docstring):
+    every full CodeChunk gets spooled to disk (app/ingest/chunk_spool.py)
+    the instant it's created, instead of sitting in an `all_chunks` list
+    for the whole repo, for the whole ingest run. ChunkMeta is what stays
+    resident in RAM instead, for every chunk, for the whole run — because
+    the two repo-global steps between chunking and embedding only ever
+    need a handful of small fields, never text/raw_source/docstring:
+
+      - call_graph.build_called_by needs name/type/calls/called_by
+      - pipeline.build_repo_profile needs name/type/imports
+
+    `called_by` starts empty (nothing calls anything yet at chunk time)
+    and is filled in place by build_called_by, exactly like it would be
+    on a full CodeChunk. Because it's the only field that changes after
+    chunking, it's also the only field that has to be patched back onto
+    the full CodeChunk when that chunk is later read off disk for its
+    embed/upsert batch (see pipeline._embed_and_upsert_in_batches) — the
+    on-disk copy's called_by is stale (still empty) by construction.
+
+    `id` and `file` aren't read by build_called_by or build_repo_profile,
+    but are kept here anyway: `id` lets _embed_and_upsert_in_batches
+    sanity-check that a disk-read batch lines up with the meta batch
+    it's paired with, and `file` is cheap and useful for logging.
+    """
+    id:        str
+    name:      str
+    type:      str
+    file:      str
+    calls:     list = field(default_factory=list)
+    called_by: list = field(default_factory=list)
+    imports:   list = field(default_factory=list)

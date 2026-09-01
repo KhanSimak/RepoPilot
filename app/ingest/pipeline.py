@@ -102,20 +102,71 @@ still happening after 2.1's batching):
   {"id","text","name"} dicts — it's just assembled incrementally now
   instead of in one final full-repo pass).
 
-  One structural peak remains, and is NOT eliminated by this change:
-  between "all files chunked" and "call graph built", `all_chunks`
-  necessarily holds every chunk's text/raw_source/docstring for the
-  whole repo at once, because build_called_by() is repo-global (a
-  caller can be in a different file than its callee) and must run
-  before any chunk's embed text is finalized. Shrinking THAT peak
-  would require changing how/when ast_chunker produces `text` and
-  `raw_source`, which is out of scope here (ast_chunker.py wasn't
-  part of this fix). See test_ingest_memory_accumulation.py for a
-  profiled measurement of this remaining, documented baseline.
+  2.1 and 2.2 left one structural peak undocumented as a known
+  baseline rather than actually fixing it (see the old note that used
+  to live here): between "all files chunked" and "call graph built",
+  `all_chunks` necessarily held every chunk's text/raw_source/
+  docstring for the whole repo at once, because build_called_by() is
+  repo-global (a caller can be in a different file than its callee)
+  and must run before any chunk's embed text is finalized.
+
+PHASE 2.3 CHANGE — SPOOL FULL CHUNKS TO DISK (fixes the OOM that
+survived 2.1/2.2, without touching ast_chunker or the repo-global call
+graph requirement):
+  The insight: build_called_by only ever needs name/type/calls/
+  called_by, and build_repo_profile only ever needs name/type/imports
+  — neither reads text, raw_source, or docstring, the three fields
+  that make a full CodeChunk heavy. So there's no real reason those
+  heavy fields need to be *resident in RAM* across the whole
+  chunking -> call-graph window; they just need to still *exist* by
+  the time the embed/upsert stage reads them, batch by batch.
+
+  So now:
+    - Every full CodeChunk is written to a ChunkSpool (see
+      app/ingest/chunk_spool.py) — a disk-backed, append-only,
+      read-back-in-original-order store — the instant it's produced
+      during chunking, and immediately falls out of scope. Nothing
+      repo-sized holding full chunks is ever resident in RAM.
+    - In its place, a lightweight ChunkMeta (see app/models/chunk.py)
+      is kept resident for the whole repo, for the whole run — one per
+      chunk, holding only id/name/type/file/calls/called_by/imports.
+      This is what build_repo_profile and build_called_by now run
+      against instead of full chunks. build_called_by mutates
+      ChunkMeta.called_by in place exactly as it used to mutate
+      CodeChunk.called_by — call_graph.py itself needed NO changes,
+      since it only ever accessed those same few attributes generically.
+    - The embed/upsert stage (_embed_and_upsert_in_batches) now reads
+      full chunks back from the spool one batch at a time, in the same
+      order they were written — which is guaranteed to match the
+      chunk_metas batch it's paired with (see chunk_spool.py's
+      docstring for why no offset/id index is needed for this). Each
+      chunk's called_by is stale on disk (still empty — it was spooled
+      before build_called_by ran), so it's patched in from the
+      corresponding ChunkMeta right after the batch is read back and
+      before chunk.to_payload() is built.
+    - _release_heavy_fields() is gone — it existed only to null out
+      heavy fields on chunks that otherwise stayed resident in
+      `all_chunks` for the rest of the run. Now, full chunks read back
+      from the spool live only inside one batch-loop iteration to
+      begin with, so there's nothing to null out; they're simply
+      garbage the moment the loop moves to the next batch.
+
+  Net effect: at NO point in the pipeline is more than one batch's
+  worth of full CodeChunk objects resident in memory at once — not
+  during chunking (spooled immediately), not during the call graph /
+  repo profile steps (only ChunkMeta is resident), and not during
+  embed/upsert (batch-sized, as it already was in 2.1). Peak memory
+  for the whole ingest is now O(batch_size + repo_chunk_count *
+  sizeof(ChunkMeta)), and a ChunkMeta is a handful of short strings and
+  small lists per chunk — orders of magnitude smaller than a CodeChunk
+  carrying that chunk's full text/raw_source/docstring. See
+  test_ingest_memory_accumulation.py, which asserts directly (via
+  gc.get_objects()) that no more than one batch's worth of full
+  CodeChunk objects are ever alive at once during a simulated ingest.
 
   Everything else — the Redis cache, Qdrant upsert semantics, the BM25
-  index contents/build call, the call graph, the repo profile, and the
-  run_ingest return contract — is unchanged.
+  index contents/build call, the call graph algorithm, the repo
+  profile algorithm, and the run_ingest return contract — is unchanged.
 """
 
 import asyncio
@@ -127,7 +178,8 @@ from pathlib import Path
 from typing import AsyncIterator, Iterator
 import git
 
-from app.models.chunk import CodeChunk
+from app.models.chunk import CodeChunk, ChunkMeta
+from app.ingest.chunk_spool import ChunkSpool
 from app.ingest.cloner import clone_repo
 from app.engine.ast_chunker import chunk_python_file
 from app.engine.embedder import embed_batch
@@ -158,27 +210,30 @@ FILE_LOG_INTERVAL = 200
 GC_EVERY_N_BATCHES = 5
 
 
-async def build_repo_profile(all_chunks: list[CodeChunk]) -> str:
+async def build_repo_profile(chunk_metas: list[ChunkMeta]) -> str:
     """
     Build a short summary of the repository vocabulary.
     This is stored in Redis and later injected into the HyDE prompt so
     query rewriting uses the repo's own symbols instead of generic Python.
+
+    Takes the lightweight ChunkMeta list (Phase 2.3), not full chunks —
+    only name/type/imports are used, which is all ChunkMeta carries.
     """
 
     class_names = [
         c.name
-        for c in all_chunks
+        for c in chunk_metas
         if c.type == "class"
     ][:20]
 
     function_names = [
         c.name
-        for c in all_chunks
+        for c in chunk_metas
         if c.type in ("function", "method")
     ][:30]
 
     imports = []
-    for chunk in all_chunks:
+    for chunk in chunk_metas:
         imports.extend(chunk.imports)
 
     # remove duplicates while preserving order
@@ -225,109 +280,102 @@ def _walk_python_files(repo_path: str) -> Iterator[tuple[str, str]]:
             yield rel_path, source
 
 
-def _chunk_all_files(local_path: str, repo_id: str) -> tuple[list[CodeChunk], int]:
+def _chunk_all_files(
+    local_path: str, repo_id: str, spool: ChunkSpool
+) -> tuple[list[ChunkMeta], int]:
     """
     Walks and chunks every .py file in the repo, one file at a time.
 
-    Returns (all_chunks, file_count). all_chunks does have to hold every
-    chunk from the whole repo — the call graph and BM25 index both need
-    that global view — but that's chunk-level metadata and source
-    snippets, not whole raw files, embedding vectors, or Qdrant points.
-    Those are the structures that made the old implementation blow past
-    512 MB, and they're what the batching below avoids materializing in
-    full.
+    PHASE 2.3: every full CodeChunk is written to `spool` (see
+    chunk_spool.py) the instant it's produced and then falls out of
+    scope — it is NEVER accumulated into a repo-sized list. What IS
+    accumulated into a repo-sized list is `chunk_metas`, the lightweight
+    projection (see ChunkMeta in app/models/chunk.py) that the call
+    graph and repo profile steps actually need. That's orders of
+    magnitude smaller per-chunk than a full CodeChunk, since it carries
+    none of text/raw_source/docstring.
+
+    Returns (chunk_metas, file_count).
     """
-    all_chunks: list[CodeChunk] = []
+    chunk_metas: list[ChunkMeta] = []
     file_count = 0
 
     for rel_path, source in _walk_python_files(local_path):
         file_count += 1
-        all_chunks.extend(chunk_python_file(source, rel_path, repo_id))
+
+        for chunk in chunk_python_file(source, rel_path, repo_id):
+            spool.write(chunk)
+            chunk_metas.append(chunk.to_meta())
+            # `chunk` (the full CodeChunk, with text/raw_source/
+            # docstring) falls out of scope right here — only its
+            # pickled bytes on disk and its lightweight ChunkMeta
+            # survive past this iteration.
+
         # `source` falls out of scope on the next loop iteration — only
         # one file's raw text is ever alive at a time.
 
         if file_count % FILE_LOG_INTERVAL == 0:
             logger.info(
                 f"[{repo_id}] chunked {file_count} files so far "
-                f"({len(all_chunks)} chunks)..."
+                f"({len(chunk_metas)} chunks)..."
             )
 
     logger.info(f"[{repo_id}] found {file_count} Python files")
-    return all_chunks, file_count
-
-
-def _release_heavy_fields(chunk: CodeChunk) -> None:
-    """
-    Drop the three large string fields a CodeChunk carries once nothing
-    downstream will read them off this object again.
-
-    Safe iff called AFTER:
-      - chunk.to_payload() has already been built for this chunk (it's
-        the last reader of raw_source and docstring, and one of the
-        readers of text), AND
-      - this chunk's entry has already been appended to bm25_seed (the
-        last reader of text).
-
-    Verified against every other module that touches CodeChunk:
-      - call_graph.build_called_by reads only name/type/calls/called_by
-        — never text/raw_source/docstring — so it's unaffected no matter
-        when this runs relative to it (and in practice this always runs
-        well after build_called_by, since call graph construction
-        happens before the embed/upsert batches even start).
-      - build_repo_profile reads only name/type/imports.
-      - bm25.build_index no longer reads chunk objects at all once this
-        change lands — it's called with `bm25_seed`, a plain list of
-        {"id","text","name"} dicts assembled *before* this function
-        runs against each chunk.
-
-    Emptying to "" (not None) keeps the field's declared `str` type
-    intact in case anything downstream does string operations on it
-    without a None-check.
-    """
-    chunk.text = ""
-    chunk.raw_source = ""
-    chunk.docstring = ""
+    return chunk_metas, file_count
 
 
 async def _embed_and_upsert_in_batches(
     repo_id: str,
-    all_chunks: list[CodeChunk],
+    chunk_metas: list[ChunkMeta],
+    spool: ChunkSpool,
     qdrant_client,
     redis_client,
     cfg,
 ) -> tuple[int, int, list[dict]]:
     """
-    Embeds and upserts all_chunks in fixed-size batches so that at most
-    one batch's worth of texts/vectors/Qdrant points is ever resident in
-    memory, instead of the whole repo's worth at once — AND incrementally
-    builds the BM25 seed list while doing so, freeing each chunk's heavy
-    fields (text/raw_source/docstring) the moment they're no longer
-    needed, instead of leaving them resident until a separate final pass.
+    Embeds and upserts all chunks in fixed-size batches so that at most
+    one batch's worth of full CodeChunks/texts/vectors/Qdrant points is
+    ever resident in memory, instead of the whole repo's worth at once —
+    AND incrementally builds the BM25 seed list while doing so.
 
-    Per batch:
-      1. Look up that batch's chunk texts in the Redis embedding cache.
-      2. Run ONNX embedding only on that batch's cache misses.
-      3. Write freshly-computed vectors back to the cache (same as before).
-      4. Build Qdrant points for just this batch (this reads text,
+    PHASE 2.3: full chunks are no longer sitting in an `all_chunks` list
+    waiting to be sliced — they live on disk in `spool`, and this
+    function reads exactly one batch's worth back at a time, in lockstep
+    with the matching slice of `chunk_metas`. Per batch:
+      1. Slice this batch's ChunkMeta entries out of chunk_metas (cheap
+         — these were already resident).
+      2. Read that many full CodeChunk objects back off the spool. This
+         relies on the spool having been written in the same order as
+         chunk_metas (see chunk_spool.py and _chunk_all_files) — a
+         mismatch is a bug, so it's checked, not assumed.
+      3. Patch each chunk's called_by from its ChunkMeta: the on-disk
+         copy is stale (empty) because it was spooled before
+         build_called_by ran against chunk_metas.
+      4. Look up that batch's chunk texts in the Redis embedding cache.
+      5. Run ONNX embedding only on that batch's cache misses.
+      6. Write freshly-computed vectors back to the cache (same as before).
+      7. Build Qdrant points for just this batch (this reads text,
          raw_source, and docstring via chunk.to_payload()) and upsert them.
-      5. Capture this batch's {"id","text","name"} entries into the
+      8. Capture this batch's {"id","text","name"} entries into the
          running bm25_seed list — same shape bm25.build_index has always
          expected, just assembled incrementally instead of in one final
          list comprehension over the whole repo.
-      6. NOW that nothing will read this chunk's text/raw_source/
-         docstring again, null them out (see _release_heavy_fields).
-      7. Let the rest of the batch's local texts/vectors/points be
-         released before moving on to the next batch.
+      9. Let the batch's full chunks and local texts/vectors/points be
+         released before moving on to the next batch — there's no
+         `_release_heavy_fields` step anymore, because these chunk
+         objects were never going to outlive this loop iteration to
+         begin with (they weren't read off disk until step 2, and
+         nothing outside this function ever holds a reference to them).
 
     Returns (cached_count, fresh_count, bm25_seed) — the same
     cached/fresh figures the old single-shot implementation returned
     (just accumulated across batches), plus the BM25 seed list that
-    run_ingest now passes straight to build_index instead of building it
-    itself in a second full pass over all_chunks.
+    run_ingest passes straight to build_index instead of building it
+    itself in a second full pass over all chunks.
     """
     batch_size = getattr(cfg, "ingest_embed_batch_size", DEFAULT_EMBED_BATCH_SIZE) or DEFAULT_EMBED_BATCH_SIZE
 
-    total = len(all_chunks)
+    total = len(chunk_metas)
     total_batches = (total + batch_size - 1) // batch_size
 
     cached_count = 0
@@ -335,7 +383,32 @@ async def _embed_and_upsert_in_batches(
     bm25_seed: list[dict] = []
 
     for batch_num, batch_start in enumerate(range(0, total, batch_size), start=1):
-        batch = all_chunks[batch_start: batch_start + batch_size]
+        batch_metas = chunk_metas[batch_start: batch_start + batch_size]
+
+        # Pull this batch's full chunks (text/raw_source/docstring and
+        # all) back off disk — sequential read, same order they were
+        # spooled in during chunking, which is guaranteed to line up
+        # with batch_metas' order (see chunk_spool.py).
+        batch = spool.read_batch(len(batch_metas))
+        if len(batch) != len(batch_metas):
+            raise RuntimeError(
+                f"[{repo_id}] chunk spool out of sync at batch {batch_num}: "
+                f"expected {len(batch_metas)} chunks, read {len(batch)}. "
+                f"Spool and chunk_metas must be written/read in lockstep."
+            )
+
+        # called_by was empty when each chunk was spooled (chunking
+        # happens before build_called_by runs against chunk_metas) — the
+        # up-to-date value lives on the meta now, so patch it in before
+        # anything reads chunk.to_payload().
+        for chunk, meta in zip(batch, batch_metas):
+            if chunk.id != meta.id:
+                raise RuntimeError(
+                    f"[{repo_id}] chunk spool out of order at batch {batch_num}: "
+                    f"expected chunk id {meta.id!r}, read {chunk.id!r}."
+                )
+            chunk.called_by = meta.called_by
+
         batch_texts = [c.text for c in batch]
 
         cache_lookup = await batch_get_embeddings(redis_client, batch_texts)
@@ -364,18 +437,11 @@ async def _embed_and_upsert_in_batches(
         ]
         await upsert_chunks(qdrant_client, cfg.qdrant_collection, points)
 
-        # Last read of text: capture this batch's BM25 seed entries
-        # BEFORE freeing anything below.
+        # Capture this batch's BM25 seed entries.
         bm25_seed.extend(
             {"id": chunk.id, "text": text, "name": chunk.name}
             for chunk, text in zip(batch, batch_texts)
         )
-
-        # Nothing downstream reads text/raw_source/docstring off these
-        # chunk objects again — release them now instead of letting them
-        # ride resident through every remaining batch plus the BM25 build.
-        for chunk in batch:
-            _release_heavy_fields(chunk)
 
         batch_cached = len(batch_texts) - len(to_embed_texts)
         batch_fresh = len(to_embed_texts)
@@ -385,14 +451,16 @@ async def _embed_and_upsert_in_batches(
         logger.info(
             f"[{repo_id}] embed batch {batch_num}/{total_batches}: "
             f"{len(batch)} chunks ({batch_fresh} fresh, {batch_cached} cached), "
-            f"heavy fields released for {batch_start + len(batch)}/{total} chunks so far"
+            f"{batch_start + len(batch)}/{total} chunks processed so far"
         )
 
-        # Explicitly drop batch-local references so this batch's texts,
-        # vectors, and points can be collected before the next batch
-        # starts — this is the "release the batch" step that keeps peak
-        # memory at O(batch_size) instead of O(repo size).
-        del batch, batch_texts, cache_lookup, to_embed_texts
+        # Explicitly drop batch-local references — including `batch`
+        # itself, the full CodeChunk objects just read off the spool —
+        # so this batch's chunks, texts, vectors, and points can all be
+        # collected before the next batch is read from disk. This is
+        # the "release the batch" step that keeps peak memory at
+        # O(batch_size) instead of O(repo size).
+        del batch, batch_metas, batch_texts, cache_lookup, to_embed_texts
         del fresh_vectors, fresh_lookup, vectors, points
 
         if batch_num % GC_EVERY_N_BATCHES == 0:
@@ -421,76 +489,88 @@ async def run_ingest(repo_id: str, github_url: str, branch: str, qdrant_client, 
     #    while this clone/pull is in progress.
     local_path = await asyncio.to_thread(clone_repo, github_url, repo_id, cfg.repos_dir, branch)
 
-    # 2 & 3. Walk every .py file and chunk it with the AST chunker, one
-    #    file at a time (see _chunk_all_files / _walk_python_files above
-    #    for why this no longer materializes every file's source at once).
-    all_chunks, file_count = _chunk_all_files(local_path, repo_id)
+    # PHASE 2.3: everything from here on runs against a ChunkSpool, which
+    # is what holds full CodeChunk objects on disk instead of in RAM for
+    # the whole repo at once. The `with` block guarantees the spool's
+    # backing temp file is deleted whether this finishes or raises.
+    with ChunkSpool() as spool:
 
-    if not all_chunks:
-        return {"status": "failed", "error": "No chunks extracted — is this a Python repo?"}
+        # 2 & 3. Walk every .py file and chunk it with the AST chunker,
+        #    one file at a time (see _walk_python_files for why this
+        #    doesn't materialize every file's source at once). Every
+        #    full chunk is written straight to `spool`; only the
+        #    lightweight chunk_metas list comes back resident in RAM
+        #    (see _chunk_all_files and ChunkMeta).
+        chunk_metas, file_count = _chunk_all_files(local_path, repo_id, spool)
 
-    logger.info(f"Extracted {len(all_chunks)} chunks from {file_count} files")
-    # Build a repository profile for HyDE query rewriting.
-    repo_profile = await build_repo_profile(all_chunks)
+        if not chunk_metas:
+            return {"status": "failed", "error": "No chunks extracted — is this a Python repo?"}
 
-    await redis_client.set(
-        f"repo_profile:{repo_id}",
-        repo_profile,
-        ex=60 * 60 * 24 * 30,  # 30 days
-    )
-    # 3b. Build the call graph (calls -> called_by) across ALL chunks in
-    #     this repo, BEFORE embedding. called_by is part of the embed text's
-    #     payload (not the embedding itself — see CodeChunk.to_payload),
-    #     so it needs to exist before we build the Qdrant points below.
-    #     This is inherently repo-global (a caller can live in a different
-    #     file than its callee), which is why all_chunks has to be fully
-    #     assembled before this step — unlike the embed/upsert stage below,
-    #     which is batched.
-    build_called_by(all_chunks)
+        logger.info(f"Extracted {len(chunk_metas)} chunks from {file_count} files")
+        # Build a repository profile for HyDE query rewriting.
+        repo_profile = await build_repo_profile(chunk_metas)
 
-    # 4. Clear any old chunks for this repo (handles re-ingest cleanly)
-    await delete_repo(qdrant_client, cfg.qdrant_collection, repo_id)
+        await redis_client.set(
+            f"repo_profile:{repo_id}",
+            repo_profile,
+            ex=60 * 60 * 24 * 30,  # 30 days
+        )
+        # 3b. Build the call graph (calls -> called_by) across ALL chunks
+        #     in this repo, BEFORE embedding. called_by is part of the
+        #     embed text's payload (not the embedding itself — see
+        #     CodeChunk.to_payload), so it needs to exist before we build
+        #     the Qdrant points below. This is inherently repo-global (a
+        #     caller can live in a different file than its callee), which
+        #     is why chunk_metas has to be fully assembled before this
+        #     step — unlike the embed/upsert stage below, which is
+        #     batched. Runs against the lightweight chunk_metas, not full
+        #     chunks — call_graph.py only ever touched name/type/calls/
+        #     called_by, so it needed no changes for this.
+        build_called_by(chunk_metas)
 
-    # 5 & 6. Embed (checking the Redis cache first) and upsert into Qdrant,
-    #    in fixed-size batches so that at most one batch's worth of
-    #    texts/vectors/points is ever resident in memory at once — not the
-    #    whole repo's worth. This also incrementally builds bm25_seed and
-    #    frees each chunk's text/raw_source/docstring as soon as they're
-    #    no longer needed, instead of letting them sit resident through
-    #    every remaining batch. See _embed_and_upsert_in_batches for
-    #    details on both.
-    cached_count, fresh_count, bm25_seed = await _embed_and_upsert_in_batches(
-        repo_id, all_chunks, qdrant_client, redis_client, cfg
-    )
-    logger.info(
-        f"[{repo_id}] embedding cache: {cached_count}/{len(all_chunks)} hits, "
-        f"embedded {fresh_count} new chunks"
-    )
+        # 4. Clear any old chunks for this repo (handles re-ingest cleanly)
+        await delete_repo(qdrant_client, cfg.qdrant_collection, repo_id)
 
-    # 7. Build the BM25 keyword index for this repo. Same input shape as
-    #    before — a list of {"id","text","name"} dicts — and BM25 still
-    #    needs that full corpus at once to compute its index (see
-    #    bm25.py); that part is unavoidable and unchanged. What changed
-    #    is that bm25_seed was assembled incrementally during the batch
-    #    loop above, one batch's worth of text at a time, rather than in
-    #    a single final pass over all_chunks while every chunk's text was
-    #    still fully resident — see the PHASE 2.2 note at the top of this
-    #    file for why that final pass was the single worst memory moment
-    #    in the old pipeline.
-    build_index(repo_id, bm25_seed)
+        # Chunking is done — flip the spool from write mode to read mode
+        # before the embed/upsert stage starts pulling batches back off it.
+        spool.finish_writing()
 
-    elapsed = round(time.perf_counter() - t0, 1)
-    logger.info(f"Ingest complete for {repo_id}: {len(all_chunks)} chunks in {elapsed}s")
+        # 5 & 6. Embed (checking the Redis cache first) and upsert into
+        #    Qdrant, in fixed-size batches so that at most one batch's
+        #    worth of full chunks/texts/vectors/points is ever resident
+        #    in memory at once — not the whole repo's worth. This also
+        #    incrementally builds bm25_seed. See
+        #    _embed_and_upsert_in_batches for details.
+        cached_count, fresh_count, bm25_seed = await _embed_and_upsert_in_batches(
+            repo_id, chunk_metas, spool, qdrant_client, redis_client, cfg
+        )
+        logger.info(
+            f"[{repo_id}] embedding cache: {cached_count}/{len(chunk_metas)} hits, "
+            f"embedded {fresh_count} new chunks"
+        )
 
-    commit_hash = git.Repo(local_path).head.commit.hexsha
+        # 7. Build the BM25 keyword index for this repo. Same input shape
+        #    as before — a list of {"id","text","name"} dicts — and BM25
+        #    still needs that full corpus at once to compute its index
+        #    (see bm25.py); that part is unavoidable and unchanged. What
+        #    changed (Phase 2.2, still true here) is that bm25_seed was
+        #    assembled incrementally during the batch loop above, one
+        #    batch's worth of text at a time, rather than in a single
+        #    final pass over every full chunk at once.
+        build_index(repo_id, bm25_seed)
 
-    return {
-        "status":          "done",
-        "chunk_count":     len(all_chunks),
-        "file_count":      file_count,
-        "languages":       ["python"],
-        "ingest_seconds":  elapsed,
-        "embeddings_cached": cached_count,
-        "embeddings_fresh":  fresh_count,
-        "last_commit":     commit_hash,
-    }
+        elapsed = round(time.perf_counter() - t0, 1)
+        logger.info(f"Ingest complete for {repo_id}: {len(chunk_metas)} chunks in {elapsed}s")
+
+        commit_hash = git.Repo(local_path).head.commit.hexsha
+
+        return {
+            "status":          "done",
+            "chunk_count":     len(chunk_metas),
+            "file_count":      file_count,
+            "languages":       ["python"],
+            "ingest_seconds":  elapsed,
+            "embeddings_cached": cached_count,
+            "embeddings_fresh":  fresh_count,
+            "last_commit":     commit_hash,
+        }

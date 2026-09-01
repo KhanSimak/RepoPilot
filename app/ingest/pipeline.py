@@ -187,6 +187,14 @@ from app.engine.vectordb import upsert_chunks, delete_repo
 from app.engine.bm25 import build_index
 from app.engine.call_graph import build_called_by
 from app.cache.redis_cache import batch_get_embeddings, set_cached_embedding
+def _log_memory(stage: str, repo_id: str) -> None:
+    """Log current process RSS in MB for Render memory diagnostics."""
+    try:
+        # Linux reports ru_maxrss in KB.
+        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        logger.info(f"[{repo_id}] MEMORY {stage}: {rss_mb:.1f} MB PEAK_RSS")
+    except Exception as e:
+        logger.warning(f"[{repo_id}] Could not read memory usage: {e}")
 
 logger = logging.getLogger(__name__)
 
@@ -436,6 +444,10 @@ async def _embed_and_upsert_in_batches(
             for chunk, vector in zip(batch, vectors)
         ]
         await upsert_chunks(qdrant_client, cfg.qdrant_collection, points)
+        _log_memory(
+            f"after embed/upsert batch {batch_num}/{total_batches}",
+            repo_id,
+        )
 
         # Capture this batch's BM25 seed entries.
         bm25_seed.extend(
@@ -478,6 +490,7 @@ async def run_ingest(repo_id: str, github_url: str, branch: str, qdrant_client, 
     unchanged from before — only how memory is used along the way changed.
     """
     t0 = time.perf_counter()
+    _log_memory("start", repo_id)
 
     # 1. Clone (or pull) the repo - clone_repo() is a blocking, synchronous
     #    subprocess call (see app/ingest/cloner.py) that can legitimately
@@ -488,6 +501,7 @@ async def run_ingest(repo_id: str, github_url: str, branch: str, qdrant_client, 
     #    instead, so the event loop stays free to serve other requests
     #    while this clone/pull is in progress.
     local_path = await asyncio.to_thread(clone_repo, github_url, repo_id, cfg.repos_dir, branch)
+    _log_memory("after clone", repo_id)
 
     # PHASE 2.3: everything from here on runs against a ChunkSpool, which
     # is what holds full CodeChunk objects on disk instead of in RAM for
@@ -502,6 +516,7 @@ async def run_ingest(repo_id: str, github_url: str, branch: str, qdrant_client, 
         #    lightweight chunk_metas list comes back resident in RAM
         #    (see _chunk_all_files and ChunkMeta).
         chunk_metas, file_count = _chunk_all_files(local_path, repo_id, spool)
+        _log_memory("after chunking", repo_id)
 
         if not chunk_metas:
             return {"status": "failed", "error": "No chunks extracted — is this a Python repo?"}
@@ -509,6 +524,7 @@ async def run_ingest(repo_id: str, github_url: str, branch: str, qdrant_client, 
         logger.info(f"Extracted {len(chunk_metas)} chunks from {file_count} files")
         # Build a repository profile for HyDE query rewriting.
         repo_profile = await build_repo_profile(chunk_metas)
+        _log_memory("after repo profile", repo_id)
 
         await redis_client.set(
             f"repo_profile:{repo_id}",
@@ -527,13 +543,16 @@ async def run_ingest(repo_id: str, github_url: str, branch: str, qdrant_client, 
         #     chunks — call_graph.py only ever touched name/type/calls/
         #     called_by, so it needed no changes for this.
         build_called_by(chunk_metas)
+        _log_memory("after repo profile", repo_id)
 
         # 4. Clear any old chunks for this repo (handles re-ingest cleanly)
         await delete_repo(qdrant_client, cfg.qdrant_collection, repo_id)
+        
 
         # Chunking is done — flip the spool from write mode to read mode
         # before the embed/upsert stage starts pulling batches back off it.
         spool.finish_writing()
+        _log_memory("after repo profile", repo_id)
 
         # 5 & 6. Embed (checking the Redis cache first) and upsert into
         #    Qdrant, in fixed-size batches so that at most one batch's
@@ -558,11 +577,13 @@ async def run_ingest(repo_id: str, github_url: str, branch: str, qdrant_client, 
         #    batch's worth of text at a time, rather than in a single
         #    final pass over every full chunk at once.
         build_index(repo_id, bm25_seed)
+        _log_memory("after BM25", repo_id)
 
         elapsed = round(time.perf_counter() - t0, 1)
         logger.info(f"Ingest complete for {repo_id}: {len(chunk_metas)} chunks in {elapsed}s")
 
         commit_hash = git.Repo(local_path).head.commit.hexsha
+        _log_memory("ingest complete", repo_id)
 
         return {
             "status":          "done",

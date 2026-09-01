@@ -13,9 +13,10 @@ Routers:
   /eval     — retrieval benchmark (Recall@5, Recall@10, MRR, latency, worst files)
 """
 from fastapi.middleware.cors import CORSMiddleware
-
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+import logging
+import os
 
 from app.config import get_settings
 from app.engine.embedder import load_embedder
@@ -24,18 +25,64 @@ from app.engine.vectordb import init_qdrant
 from app.cache.redis_cache import init_redis
 from app.routers import repos, search, stats, query, eval as eval_router, graph as graph_router
 
+try:
+    import resource
+except ImportError:
+    resource = None
 
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+logger = logging.getLogger(__name__)
+
+
+def _log_startup_memory(stage: str) -> None:
+    try:
+        if resource is not None:
+            mb = resource.getrusage(
+                resource.RUSAGE_SELF
+            ).ru_maxrss / 1024
+            logger.info(
+                f"STARTUP MEMORY {stage}: {mb:.1f} MB PEAK_RSS"
+            )
+        elif psutil is not None:
+            mb = psutil.Process(
+                os.getpid()
+            ).memory_info().rss / (1024 * 1024)
+            logger.info(
+                f"STARTUP MEMORY {stage}: {mb:.1f} MB RSS"
+            )
+    except Exception as e:
+        logger.warning(
+            f"Startup memory check failed: {e}"
+        )
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cfg = get_settings()
-    app.state.settings = cfg
-    app.state.qdrant    = await init_qdrant(cfg)
-    app.state.embedder  = load_embedder(cfg)
-    app.state.reranker = load_reranker(cfg) 
-    app.state.redis     = await init_redis(cfg)
-    yield
-    await app.state.redis.aclose()
 
+    _log_startup_memory("begin")
+
+    app.state.settings = cfg
+
+    app.state.qdrant = await init_qdrant(cfg)
+    _log_startup_memory("after qdrant")
+
+    app.state.embedder = load_embedder(cfg)
+    _log_startup_memory("after embedder")
+
+    app.state.reranker = load_reranker(cfg)
+    _log_startup_memory("after reranker")
+
+    app.state.redis = await init_redis(cfg)
+    _log_startup_memory("after redis")
+
+    logger.info("===== STARTUP COMPLETE =====")
+
+    yield
+
+    await app.state.redis.aclose()
 
 app = FastAPI(
     title="Codebase Q&A Engine — Final Phase",

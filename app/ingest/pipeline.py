@@ -176,7 +176,6 @@ import logging
 from pathlib import Path
 from typing import AsyncIterator, Iterator
 import git
-import resource
 
 from app.models.chunk import CodeChunk, ChunkMeta
 from app.ingest.chunk_spool import ChunkSpool
@@ -187,22 +186,50 @@ from app.engine.vectordb import upsert_chunks, delete_repo
 from app.engine.bm25 import build_index
 from app.engine.call_graph import build_called_by
 from app.cache.redis_cache import batch_get_embeddings, set_cached_embedding
+import os
 
-logger = logging.getLogger(__name__)
+try:
+    import resource
+except ImportError:
+    resource = None
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 
 def _log_memory(stage: str, repo_id: str) -> None:
-    """Log peak process RSS in MB for Render memory diagnostics."""
+    """Log process memory without breaking Windows local development."""
     try:
-        # Linux: ru_maxrss is reported in KB.
-        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        if resource is not None:
+            # Linux/macOS: ru_maxrss
+            rss_mb = resource.getrusage(
+                resource.RUSAGE_SELF
+            ).ru_maxrss / 1024
+        elif psutil is not None:
+            # Windows fallback
+            rss_mb = psutil.Process(os.getpid()).memory_info().rss / (
+                1024 * 1024
+            )
+        else:
+            logger.warning(
+                f"[{repo_id}] Memory logging unavailable on this platform"
+            )
+            return
+
         logger.info(
-            f"[{repo_id}] MEMORY {stage}: {rss_mb:.1f} MB PEAK_RSS"
+            f"[{repo_id}] MEMORY {stage}: "
+            f"{rss_mb:.1f} MB RSS"
         )
     except Exception as e:
         logger.warning(
             f"[{repo_id}] Could not read memory usage: {e}"
         )
+
+logger = logging.getLogger(__name__)
+
+
 
 EXCLUDE_DIRS = {"node_modules", ".git", "__pycache__", ".venv", "venv", "dist", "build", ".pytest_cache"}
 MAX_FILE_SIZE_BYTES = 500_000   # skip huge generated/minified files

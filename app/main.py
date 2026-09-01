@@ -12,19 +12,45 @@ Routers:
   /stats    — cache hit rate
   /eval     — retrieval benchmark (Recall@5, Recall@10, MRR, latency, worst files)
 """
-from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
 import logging
 import os
 
-from app.config import get_settings
-from app.engine.embedder import load_embedder
-from app.engine.reranker import load_reranker
-from app.engine.vectordb import init_qdrant
-from app.cache.redis_cache import init_redis
-from app.routers import repos, search, stats, query, eval as eval_router, graph as graph_router
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+logger.warning("===== MAIN IMPORT START =====")
+
+from fastapi.middleware.cors import CORSMiddleware
+logger.warning("===== FASTAPI IMPORTED =====")
+
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+logger.warning("===== CORE FASTAPI IMPORTED =====")
+
+from app.config import get_settings
+logger.warning("===== CONFIG IMPORTED =====")
+
+from app.engine.embedder import load_embedder
+logger.warning("===== EMBEDDER MODULE IMPORTED =====")
+
+from app.engine.reranker import load_reranker
+logger.warning("===== RERANKER MODULE IMPORTED =====")
+
+from app.engine.vectordb import init_qdrant
+logger.warning("===== VECTORDB MODULE IMPORTED =====")
+
+from app.cache.redis_cache import init_redis
+logger.warning("===== REDIS MODULE IMPORTED =====")
+
+from app.routers import (
+    repos,
+    search,
+    stats,
+    query,
+    eval as eval_router,
+    graph as graph_router,
+)
+logger.warning("===== ALL ROUTERS IMPORTED =====")
 try:
     import resource
 except ImportError:
@@ -36,6 +62,7 @@ except ImportError:
     psutil = None
 
 logger = logging.getLogger(__name__)
+logger.warning("===== MAIN.PY IMPORT START =====")
 
 
 def _log_startup_memory(stage: str) -> None:
@@ -83,6 +110,7 @@ async def lifespan(app: FastAPI):
     yield
 
     await app.state.redis.aclose()
+
 
 app = FastAPI(
     title="Codebase Q&A Engine — Final Phase",

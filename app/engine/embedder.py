@@ -156,8 +156,14 @@ def _encode_sync(texts: list[str]) -> list[list[float]]:
     encodings = _tokenizer.encode_batch(texts)
 
     input_ids = np.array([e.ids for e in encodings], dtype=np.int64)
-    attention_mask = np.array([e.attention_mask for e in encodings], dtype=np.int64)
-    token_type_ids = np.array([e.type_ids for e in encodings], dtype=np.int64)
+    attention_mask = np.array(
+        [e.attention_mask for e in encodings],
+        dtype=np.int64,
+    )
+    token_type_ids = np.array(
+        [e.type_ids for e in encodings],
+        dtype=np.int64,
+    )
 
     ort_inputs = {
         "input_ids": input_ids,
@@ -165,11 +171,29 @@ def _encode_sync(texts: list[str]) -> list[list[float]]:
         "token_type_ids": token_type_ids,
     }
 
-    outputs = _session.run(_output_names, ort_inputs)
-    last_hidden_state = outputs[_output_names.index("last_hidden_state")]
+    logger.info(
+        "ONNX BEFORE session.run: batch=%d",
+        len(texts),
+    )
 
-    vectors = _mean_pool_normalize(last_hidden_state, attention_mask)
+    outputs = _session.run(_output_names, ort_inputs)
+
+    logger.info(
+        "ONNX AFTER session.run: batch=%d",
+        len(texts),
+    )
+
+    last_hidden_state = outputs[
+        _output_names.index("last_hidden_state")
+    ]
+
+    vectors = _mean_pool_normalize(
+        last_hidden_state,
+        attention_mask,
+    )
+
     return vectors.tolist()
+
 
 
 async def embed_text(text: str, is_query: bool = True) -> list[float]:
@@ -206,7 +230,7 @@ async def embed_batch(texts: list[str]) -> list[list[float]]:
     loop = asyncio.get_event_loop()
     all_vectors: list[list[float]] = []
     for i in range(0, len(texts), 8):
-        batch = texts[i:i + 32]
+        batch = texts[i:i + 8]
         vectors = await loop.run_in_executor(_executor, _encode_sync, batch)
         all_vectors.extend(vectors)
 

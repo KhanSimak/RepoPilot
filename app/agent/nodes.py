@@ -972,18 +972,28 @@ def select_execution_path_symbol(
     with real overlap, not merely nudged down by a soft score - see the
     "relevant first" partition below.
 
-    This ranking is applied ONLY where there's genuinely no single correct
-    next hop to pick from structure alone: with no established execution
-    position yet, or once the direct-callee walk below has no match. It
-    deliberately does NOT touch that walk itself - a real call edge from a
-    KNOWN current position is a stronger signal than any relevance
-    heuristic, and an earlier fix here specifically replaced a flat
-    semantic-similarity sort with chain-aware graph walking because
-    similarity alone let a topically-close but graph-unrelated symbol
-    (make_response, url_for, get) outrank the actual next hop
-    (match_request, dispatch_request) - see _preferred_graph_symbol's
-    comment. Relevance now only ranks WITHIN the graph-connectivity-
-    filtered candidate pool below, never instead of it.
+    This ranking is applied at two points. (1) Full ranked_choice() below,
+    where there's genuinely no single correct next hop to pick from
+    structure alone: no established execution position yet, or the
+    direct-callee walk finds no match at all. (2) As a narrow tiebreak
+    WITHIN the direct-callee walk itself: when the current position's
+    `calls` name MORE THAN ONE real, eligible callee, the first such
+    callee (in declaration order) with positive relevance is preferred
+    over an earlier-declared but irrelevant one - e.g. create_app calling
+    both register_user/send_registration_email and a genuinely relevant
+    step, in that order, no longer wanders into the former just because
+    they were declared first. A single unambiguous edge is always taken
+    regardless of relevance - this never introduces a candidate that
+    ISN'T a real direct callee - and when none of several real edges have
+    any relevance-term overlap, the original declaration-order choice is
+    preserved exactly as before. An earlier fix here specifically
+    replaced a flat semantic-similarity sort with chain-aware graph
+    walking because similarity alone let a topically-close but graph-
+    unrelated symbol (make_response, url_for, get) outrank the actual
+    next hop (match_request, dispatch_request) - see
+    _preferred_graph_symbol's comment; this tiebreak only ever chooses
+    among ACTUAL direct callees, so it doesn't reintroduce that failure
+    mode.
     """
     expanded = _expanded_symbols(trace)
 
@@ -1074,27 +1084,43 @@ def select_execution_path_symbol(
     direct_calls = current.get("calls", [])
 
     # Walk direct callees of the current execution symbol in declaration
-    # order (the order calls actually appear in `current`'s source), not
-    # by rerank/semantic score. Two direct callees can be equally
-    # "connected" to the current node, but only one of them is the actual
-    # next step the code executes - e.g. full_dispatch_request calls both
-    # match_request and dispatch_request, in that order, but dispatch_request
-    # happened to have a higher rerank score, so scoring picked it FIRST
-    # and visited the real execution path out of order. This is the same
-    # loop that used to only run as a fallback when no direct callee was
-    # found at all (a redundant second lookup of `current` under a
-    # different name, `current_chunk`) - it's the only place that should
-    # ever choose among direct callees, so it runs unconditionally here.
-    # Deliberately NOT relevance-ranked: it's the same reasoning as in the
-    # docstring above - a real call edge from a known position outranks
-    # any heuristic, including this one.
+    # order (the order calls actually appear in `current`'s source) by
+    # default, not by rerank/semantic score - e.g. full_dispatch_request
+    # calls both match_request and dispatch_request, in that order, and a
+    # higher rerank score for dispatch_request must not visit it first.
+    # This is the same loop that used to only run as a fallback when no
+    # direct callee was found at all (a redundant second lookup of
+    # `current` under a different name, `current_chunk`) - it's the only
+    # place that should ever choose among direct callees.
+    #
+    # Among MULTIPLE real direct callees, relevance to the question/
+    # outstanding missing requirements breaks the tie: create_app calling
+    # both register_user/send_registration_email and a step actually
+    # relevant to the question, in that order, should prefer the relevant
+    # one rather than wandering into whichever was declared first. This
+    # only ever chooses among candidates that ARE real direct callees -
+    # it never reaches for something unrelated the way a flat semantic-
+    # similarity sort would - and declaration order is preserved exactly
+    # as before whenever there's only one match, or when none of several
+    # matches have any relevance-term overlap at all.
+    matched_direct_callees = []
     for call in direct_calls:
         next_chunk = next(
             (c for c in candidates if _matches_symbol(call, c.get("name", ""))),
             None,
         )
         if next_chunk:
-            return next_chunk["name"]
+            matched_direct_callees.append(next_chunk)
+
+    if matched_direct_callees:
+        if query_terms:
+            relevant_direct_callees = [
+                c for c in matched_direct_callees
+                if _relevance_score(c, query_terms) > 0
+            ]
+            if relevant_direct_callees:
+                return relevant_direct_callees[0]["name"]
+        return matched_direct_callees[0]["name"]
 
     # Fall back to the best remaining runtime implementation.
     runtime = [c for c in candidates if _is_runtime_implementation(c)]

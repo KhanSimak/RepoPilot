@@ -57,6 +57,30 @@ except Exception:
 MAX_CONTEXT_TOKENS   = 2500   # hard cap on total context sent to the final LLM call
 MAX_TOKENS_PER_CHUNK = 150   # budget for each individual compression call
 
+# select_context() used to budget ONLY chunk["text"] - the raw code slice -
+# even though MAX_CONTEXT_TOKENS's own comment above promises a cap on
+# "total context sent to the final LLM call". What actually gets sent
+# (build_prompt(), below) wraps every chunk in a fixed metadata block
+# (Symbol N / Type / Name / File / Lines / Calls / Called by / Registered
+# via / Code: labels) and adds system_prompt + user_msg's own boilerplate
+# on top - none of which counted against the budget, so the real prompt
+# could run well over the nominal 2500 tokens. These are measured (not
+# guessed) from the actual template text below, via count_tokens's own
+# ~4-chars/token fallback (same estimate method used everywhere else in
+# this module, since exact billing-grade precision isn't the point here -
+# see the module docstring): the largest system_prompt across all four
+# intents (understand_flow, tightened) is 320 tokens; a populated per-
+# chunk wrapper (a few Calls/Called by entries, not the empty-metadata
+# best case) is ~61 tokens; user_msg's fixed boilerplate outside
+# {context}/{question} is 63 tokens. Reserving the worst case up front
+# means the budget holds regardless of which intent build_prompt() ends
+# up using - select_context() doesn't know `intent` yet at the point it
+# runs (see pipeline.py's call order: select_context() before
+# build_prompt()), so it can't reserve a tighter, intent-specific amount.
+_SYSTEM_PROMPT_RESERVE_TOKENS = 320
+_USER_MSG_WRAPPER_TOKENS = 63
+_PER_CHUNK_WRAPPER_OVERHEAD_TOKENS = 61
+
 
 def _tighten_instructions(text: str) -> str:
     """Collapse blank-line padding in static, code-free instruction text.
@@ -97,23 +121,36 @@ def select_context(chunks: list[dict], max_tokens: int = MAX_CONTEXT_TOKENS):
     selected = []
     used = 0
 
+    # Everything build_prompt() adds around the chunks themselves -
+    # system_prompt plus user_msg's fixed boilerplate - comes out of the
+    # same max_tokens budget up front, so what's left genuinely bounds
+    # the full prompt, not just the raw chunk text.
+    effective_max_tokens = max(
+        0, max_tokens - _SYSTEM_PROMPT_RESERVE_TOKENS - _USER_MSG_WRAPPER_TOKENS
+    )
+
     for chunk in chunks:
       # Do not cut a selected implementation at an arbitrary character
       # boundary.  The existing token budget below is the single authority
       # for deciding whether a complete chunk fits.
       text = chunk["text"]
 
-      tokens = count_tokens(text)
+      # + the per-chunk metadata wrapper build_prompt() adds (Symbol N /
+      # Type / Name / File / Lines / Calls / Called by / Registered via /
+      # Code: labels) - not just the raw code text - so a chunk that
+      # "fits" here actually fits once wrapped, not just on its own.
+      tokens = count_tokens(text) + _PER_CHUNK_WRAPPER_OVERHEAD_TOKENS
 
-      if used + tokens > max_tokens:
+      if used + tokens > effective_max_tokens:
        # Never produce an empty prompt merely because the strongest chunk is
        # larger than the context budget.
-       if not selected and max_tokens > 0:
+       if not selected and effective_max_tokens > 0:
+        truncate_to = max(0, effective_max_tokens - _PER_CHUNK_WRAPPER_OVERHEAD_TOKENS)
         if "_enc" in globals():
-         text = _enc.decode(_enc.encode(text)[:max_tokens])
+         text = _enc.decode(_enc.encode(text)[:truncate_to])
         else:
-         text = text[:max_tokens * 4]
-        tokens = count_tokens(text)
+         text = text[:truncate_to * 4]
+        tokens = count_tokens(text) + _PER_CHUNK_WRAPPER_OVERHEAD_TOKENS
        else:
         continue
 
@@ -124,7 +161,9 @@ def select_context(chunks: list[dict], max_tokens: int = MAX_CONTEXT_TOKENS):
       used += tokens
 
     logger.info(
-        f"Context budget: {used}/{max_tokens} tokens "
+        f"Context budget: {used}/{effective_max_tokens} chunk tokens "
+        f"({used + _SYSTEM_PROMPT_RESERVE_TOKENS + _USER_MSG_WRAPPER_TOKENS}/{max_tokens} "
+        f"total est. incl. system_prompt+wrapper) "
         f"({len(selected)}/{len(chunks)} chunks)"
     )
     logger.debug(

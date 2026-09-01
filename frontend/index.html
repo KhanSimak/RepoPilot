@@ -241,10 +241,9 @@
   </header>
 
   <div class="setup-note" id="cors-note">
-    <strong>First time? One backend change is needed.</strong> FastAPI blocks cross-origin requests by default, and this page (opened as a local file) counts as a different origin than your API. Add this to <code>app/main.py</code> right after <code>app = FastAPI(...)</code>, then restart the server:
-    <br><code>from fastapi.middleware.cors import CORSMiddleware</code>
-    <br><code>app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])</code>
-    <br>Once requests below succeed, this note won't matter — feel free to ignore it if CORS is already enabled.
+    <strong>First time,The ingest repo will take time
+      
+    
   </div>
 
   <div id="main-tabs">

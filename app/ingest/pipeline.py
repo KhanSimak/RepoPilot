@@ -51,10 +51,71 @@ PHASE 2.1 CHANGE — MEMORY-BOUNDED INGESTION (fixes Render OOM):
      stage is now O(batch_size), not O(repo size), regardless of how
      many chunks the repo has.
 
+PHASE 2.2 CHANGE — THE REMAINING LEAK: all_chunks ITSELF (fixes OOM
+still happening after 2.1's batching):
+  2.1 bounded the *vectors and Qdrant points* per batch, but it left
+  something bigger untouched: `all_chunks` holds full CodeChunk
+  objects for the WHOLE repo, and each CodeChunk (see
+  app/models/chunk.py) carries THREE separate large strings per chunk —
+  `text` (enriched embed text: file + name + docstring + code),
+  `raw_source` (the code again, unenriched), and `docstring` — so each
+  chunk holds roughly 2x its own source size, and all_chunks holds all
+  of that for the entire repo, for the ENTIRE ingest run, because
+  nothing ever freed it. Two consequences:
+
+    a) `raw_source` and `docstring` are only ever read once each, when
+       chunk.to_payload() is built for that chunk's own Qdrant upsert.
+       After that batch is upserted, nothing in the rest of the
+       pipeline ever reads them again — but the old code kept every
+       chunk's raw_source/docstring alive all the way through the
+       *entire* embed/upsert loop (for every other batch) and into the
+       BM25 build at the end, for no reason.
+
+    b) `text` is read twice: once for embedding (per batch) and once
+       more for the BM25 seed — but the old code only extracted the
+       BM25 seed in ONE FINAL PASS after every batch had already run:
+       `build_index(repo_id, [{"id": c.id, "text": c.text, ...} for c
+       in all_chunks])`. That means right at the moment BM25Okapi is
+       building its own tokenized corpus (itself a repo-sized
+       allocation), `all_chunks` STILL had every chunk's full text
+       resident too — the single highest memory instant in the whole
+       pipeline, and it came right after the loop that was supposed to
+       have bounded things.
+
+  The fix: extend `_embed_and_upsert_in_batches` to also build the
+  BM25 seed incrementally, per batch (capturing each chunk's `text`
+  into `bm25_seed` in the same pass that already reads it for
+  embedding), and to null out `text`, `raw_source`, and `docstring` on
+  each chunk immediately after that chunk's Qdrant payload and BM25
+  seed entry have both been captured. Nothing downstream ever reads
+  those fields off the chunk object again (verified against
+  call_graph.py and bm25.py — call-graph construction only touches
+  `name`/`type`/`calls`/`called_by`, and BM25 now reads from
+  `bm25_seed`, not from the chunk objects). What's left resident in
+  `all_chunks` for the rest of the run is just the small fields
+  (id, name, type, calls, called_by, imports, decorators, ...), not
+  the multi-KB source/text/docstring per chunk.
+
+  This does NOT touch call_graph.py's build_called_by (which never
+  reads text/raw_source/docstring to begin with — verified below) or
+  bm25.py's build_index (same input shape it always took: a list of
+  {"id","text","name"} dicts — it's just assembled incrementally now
+  instead of in one final full-repo pass).
+
+  One structural peak remains, and is NOT eliminated by this change:
+  between "all files chunked" and "call graph built", `all_chunks`
+  necessarily holds every chunk's text/raw_source/docstring for the
+  whole repo at once, because build_called_by() is repo-global (a
+  caller can be in a different file than its callee) and must run
+  before any chunk's embed text is finalized. Shrinking THAT peak
+  would require changing how/when ast_chunker produces `text` and
+  `raw_source`, which is out of scope here (ast_chunker.py wasn't
+  part of this fix). See test_ingest_memory_accumulation.py for a
+  profiled measurement of this remaining, documented baseline.
+
   Everything else — the Redis cache, Qdrant upsert semantics, the BM25
-  index (built once at the end from the full chunk list, same as
-  before), the call graph, the repo profile, and the run_ingest return
-  contract — is unchanged.
+  index contents/build call, the call graph, the repo profile, and the
+  run_ingest return contract — is unchanged.
 """
 
 import asyncio
@@ -195,29 +256,74 @@ def _chunk_all_files(local_path: str, repo_id: str) -> tuple[list[CodeChunk], in
     return all_chunks, file_count
 
 
+def _release_heavy_fields(chunk: CodeChunk) -> None:
+    """
+    Drop the three large string fields a CodeChunk carries once nothing
+    downstream will read them off this object again.
+
+    Safe iff called AFTER:
+      - chunk.to_payload() has already been built for this chunk (it's
+        the last reader of raw_source and docstring, and one of the
+        readers of text), AND
+      - this chunk's entry has already been appended to bm25_seed (the
+        last reader of text).
+
+    Verified against every other module that touches CodeChunk:
+      - call_graph.build_called_by reads only name/type/calls/called_by
+        — never text/raw_source/docstring — so it's unaffected no matter
+        when this runs relative to it (and in practice this always runs
+        well after build_called_by, since call graph construction
+        happens before the embed/upsert batches even start).
+      - build_repo_profile reads only name/type/imports.
+      - bm25.build_index no longer reads chunk objects at all once this
+        change lands — it's called with `bm25_seed`, a plain list of
+        {"id","text","name"} dicts assembled *before* this function
+        runs against each chunk.
+
+    Emptying to "" (not None) keeps the field's declared `str` type
+    intact in case anything downstream does string operations on it
+    without a None-check.
+    """
+    chunk.text = ""
+    chunk.raw_source = ""
+    chunk.docstring = ""
+
+
 async def _embed_and_upsert_in_batches(
     repo_id: str,
     all_chunks: list[CodeChunk],
     qdrant_client,
     redis_client,
     cfg,
-) -> tuple[int, int]:
+) -> tuple[int, int, list[dict]]:
     """
     Embeds and upserts all_chunks in fixed-size batches so that at most
     one batch's worth of texts/vectors/Qdrant points is ever resident in
-    memory, instead of the whole repo's worth at once.
+    memory, instead of the whole repo's worth at once — AND incrementally
+    builds the BM25 seed list while doing so, freeing each chunk's heavy
+    fields (text/raw_source/docstring) the moment they're no longer
+    needed, instead of leaving them resident until a separate final pass.
 
     Per batch:
       1. Look up that batch's chunk texts in the Redis embedding cache.
       2. Run ONNX embedding only on that batch's cache misses.
       3. Write freshly-computed vectors back to the cache (same as before).
-      4. Build Qdrant points for just this batch and upsert them.
-      5. Let the batch's local texts/vectors/points be released before
-         moving on to the next batch.
+      4. Build Qdrant points for just this batch (this reads text,
+         raw_source, and docstring via chunk.to_payload()) and upsert them.
+      5. Capture this batch's {"id","text","name"} entries into the
+         running bm25_seed list — same shape bm25.build_index has always
+         expected, just assembled incrementally instead of in one final
+         list comprehension over the whole repo.
+      6. NOW that nothing will read this chunk's text/raw_source/
+         docstring again, null them out (see _release_heavy_fields).
+      7. Let the rest of the batch's local texts/vectors/points be
+         released before moving on to the next batch.
 
-    Returns (cached_count, fresh_count) — same figures the old
-    single-shot implementation returned, just accumulated across batches
-    instead of computed in one pass.
+    Returns (cached_count, fresh_count, bm25_seed) — the same
+    cached/fresh figures the old single-shot implementation returned
+    (just accumulated across batches), plus the BM25 seed list that
+    run_ingest now passes straight to build_index instead of building it
+    itself in a second full pass over all_chunks.
     """
     batch_size = getattr(cfg, "ingest_embed_batch_size", DEFAULT_EMBED_BATCH_SIZE) or DEFAULT_EMBED_BATCH_SIZE
 
@@ -226,6 +332,7 @@ async def _embed_and_upsert_in_batches(
 
     cached_count = 0
     fresh_count = 0
+    bm25_seed: list[dict] = []
 
     for batch_num, batch_start in enumerate(range(0, total, batch_size), start=1):
         batch = all_chunks[batch_start: batch_start + batch_size]
@@ -249,11 +356,26 @@ async def _embed_and_upsert_in_batches(
             for t in batch_texts
         ]
 
+        # Last reads of raw_source/docstring (via to_payload) and one of
+        # the two reads of text (the other being batch_texts above).
         points = [
             {"id": chunk.id, "vector": vector, "payload": chunk.to_payload()}
             for chunk, vector in zip(batch, vectors)
         ]
         await upsert_chunks(qdrant_client, cfg.qdrant_collection, points)
+
+        # Last read of text: capture this batch's BM25 seed entries
+        # BEFORE freeing anything below.
+        bm25_seed.extend(
+            {"id": chunk.id, "text": text, "name": chunk.name}
+            for chunk, text in zip(batch, batch_texts)
+        )
+
+        # Nothing downstream reads text/raw_source/docstring off these
+        # chunk objects again — release them now instead of letting them
+        # ride resident through every remaining batch plus the BM25 build.
+        for chunk in batch:
+            _release_heavy_fields(chunk)
 
         batch_cached = len(batch_texts) - len(to_embed_texts)
         batch_fresh = len(to_embed_texts)
@@ -262,7 +384,8 @@ async def _embed_and_upsert_in_batches(
 
         logger.info(
             f"[{repo_id}] embed batch {batch_num}/{total_batches}: "
-            f"{len(batch)} chunks ({batch_fresh} fresh, {batch_cached} cached)"
+            f"{len(batch)} chunks ({batch_fresh} fresh, {batch_cached} cached), "
+            f"heavy fields released for {batch_start + len(batch)}/{total} chunks so far"
         )
 
         # Explicitly drop batch-local references so this batch's texts,
@@ -275,7 +398,7 @@ async def _embed_and_upsert_in_batches(
         if batch_num % GC_EVERY_N_BATCHES == 0:
             gc.collect()
 
-    return cached_count, fresh_count
+    return cached_count, fresh_count, bm25_seed
 
 
 async def run_ingest(repo_id: str, github_url: str, branch: str, qdrant_client, redis_client, cfg) -> dict:
@@ -331,8 +454,12 @@ async def run_ingest(repo_id: str, github_url: str, branch: str, qdrant_client, 
     # 5 & 6. Embed (checking the Redis cache first) and upsert into Qdrant,
     #    in fixed-size batches so that at most one batch's worth of
     #    texts/vectors/points is ever resident in memory at once — not the
-    #    whole repo's worth. See _embed_and_upsert_in_batches for details.
-    cached_count, fresh_count = await _embed_and_upsert_in_batches(
+    #    whole repo's worth. This also incrementally builds bm25_seed and
+    #    frees each chunk's text/raw_source/docstring as soon as they're
+    #    no longer needed, instead of letting them sit resident through
+    #    every remaining batch. See _embed_and_upsert_in_batches for
+    #    details on both.
+    cached_count, fresh_count, bm25_seed = await _embed_and_upsert_in_batches(
         repo_id, all_chunks, qdrant_client, redis_client, cfg
     )
     logger.info(
@@ -340,11 +467,17 @@ async def run_ingest(repo_id: str, github_url: str, branch: str, qdrant_client, 
         f"embedded {fresh_count} new chunks"
     )
 
-    # 7. Build the BM25 keyword index for this repo. Same as before: BM25
-    #    needs the full corpus at once to compute its index (see bm25.py),
-    #    and that corpus is small relative to files+vectors+points, so it's
-    #    not part of the OOM fix here.
-    build_index(repo_id, [{"id": c.id, "text": c.text, "name": c.name} for c in all_chunks])
+    # 7. Build the BM25 keyword index for this repo. Same input shape as
+    #    before — a list of {"id","text","name"} dicts — and BM25 still
+    #    needs that full corpus at once to compute its index (see
+    #    bm25.py); that part is unavoidable and unchanged. What changed
+    #    is that bm25_seed was assembled incrementally during the batch
+    #    loop above, one batch's worth of text at a time, rather than in
+    #    a single final pass over all_chunks while every chunk's text was
+    #    still fully resident — see the PHASE 2.2 note at the top of this
+    #    file for why that final pass was the single worst memory moment
+    #    in the old pipeline.
+    build_index(repo_id, bm25_seed)
 
     elapsed = round(time.perf_counter() - t0, 1)
     logger.info(f"Ingest complete for {repo_id}: {len(all_chunks)} chunks in {elapsed}s")

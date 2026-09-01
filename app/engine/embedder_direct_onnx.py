@@ -68,64 +68,139 @@ _executor = ThreadPoolExecutor(max_workers=4)
 
 def load_embedder(cfg):
     """
-    Called once at app startup - same call site/contract as embedder.py's
-    load_embedder(cfg): main.py's lifespan does
-    app.state.embedder = load_embedder(cfg). No production wiring changes
-    yet; this exists so it CAN be swapped in once validated.
+    Called once at app startup.
+
+    Loads:
+      tokenizer.json
+      special_tokens_map.json
+      model.onnx
+
+    using only:
+      tokenizers
+      onnxruntime
+
+    No transformers, optimum, torch, or sentence-transformers.
     """
     global _tokenizer, _session, _output_names
 
-    logger.info(f"Loading direct-ONNX embedder (no optimum/transformers): {getattr(cfg, 'embed_model', MODEL_DIR)}")
+    model_dir = getattr(cfg, "embed_model", None) or MODEL_DIR
 
-    tokenizer_path = os.path.join(MODEL_DIR, "tokenizer.json")
-    _tokenizer = Tokenizer.from_file(tokenizer_path)
+    logger.info(
+        "Loading direct-ONNX embedder from %s "
+        "(no optimum/transformers/torch)",
+        model_dir,
+    )
 
-    # Determine the pad token/id from the model's own special_tokens_map.json
-    # rather than hardcoding "[PAD]" - correct for this exact model's
-    # vocab, not an assumption about BERT-family tokenizers in general.
-    special_tokens_path = os.path.join(MODEL_DIR, "special_tokens_map.json")
-    with open(special_tokens_path) as f:
-        special_tokens = json.load(f)
-    pad_token = special_tokens.get("pad_token", "[PAD]")
-    if isinstance(pad_token, dict):  # some exports store {"content": "...", ...}
-        pad_token = pad_token.get("content", "[PAD]")
-    pad_id = _tokenizer.token_to_id(pad_token)
-    if pad_id is None:
-        raise RuntimeError(
-            f"Pad token '{pad_token}' not found in tokenizer vocab - "
-            f"check {tokenizer_path} matches {special_tokens_path}."
+    tokenizer_path = os.path.join(model_dir, "tokenizer.json")
+    special_tokens_path = os.path.join(
+        model_dir,
+        "special_tokens_map.json",
+    )
+    model_path = os.path.join(MODEL_DIR, "model_int8.onnx")
+
+    if not os.path.exists(tokenizer_path):
+        raise FileNotFoundError(
+            f"Tokenizer not found: {tokenizer_path}"
         )
 
-    # Same intent as embedder.py's padding=True / truncation=True kwargs,
-    # just configured once here instead of passed per-call: pad to the
-    # LONGEST sequence in each batch (length=None), not a fixed length.
+    if not os.path.exists(special_tokens_path):
+        raise FileNotFoundError(
+            f"Special token map not found: {special_tokens_path}"
+        )
+
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(
+            f"ONNX model not found: {model_path}"
+        )
+
+    # ---------------------------------------------------------
+    # Tokenizer
+    # ---------------------------------------------------------
+
+    _tokenizer = Tokenizer.from_file(tokenizer_path)
+
+    with open(special_tokens_path, encoding="utf-8") as f:
+        special_tokens = json.load(f)
+
+    pad_token = special_tokens.get("pad_token", "[PAD]")
+
+    if isinstance(pad_token, dict):
+        pad_token = pad_token.get("content", "[PAD]")
+
+    pad_id = _tokenizer.token_to_id(pad_token)
+
+    if pad_id is None:
+        raise RuntimeError(
+            f"Pad token '{pad_token}' not found in tokenizer vocab. "
+            f"Check that tokenizer.json and special_tokens_map.json "
+            f"belong to the same model."
+        )
+
+    # Same behavior as:
+    #
+    # AutoTokenizer(...,
+    #     padding=True,
+    #     truncation=True,
+    #     max_length=512)
+    #
     _tokenizer.enable_truncation(max_length=512)
-    _tokenizer.enable_padding(pad_id=pad_id, pad_token=pad_token, length=None)
+    _tokenizer.enable_padding(
+        pad_id=pad_id,
+        pad_token=pad_token,
+        length=None,
+    )
+
+    # ---------------------------------------------------------
+    # ONNX Runtime
+    # ---------------------------------------------------------
 
     sess_options = ort.SessionOptions()
     sess_options.intra_op_num_threads = 1
     sess_options.inter_op_num_threads = 1
 
-    model_path = os.path.join(MODEL_DIR, "model.onnx")
     _session = ort.InferenceSession(
         model_path,
         sess_options=sess_options,
         providers=["CPUExecutionProvider"],
     )
-    _output_names = [o.name for o in _session.get_outputs()]
+
+    _output_names = [
+        output.name
+        for output in _session.get_outputs()
+    ]
 
     if "last_hidden_state" not in _output_names:
         raise RuntimeError(
-            f"Expected ONNX output 'last_hidden_state', got {_output_names} "
-            f"from {model_path} - model export may not match what this "
-            f"module expects."
+            "Expected ONNX output 'last_hidden_state', "
+            f"but got {_output_names}."
+        )
+
+    # Useful startup validation.
+    input_names = {
+        inp.name
+        for inp in _session.get_inputs()
+    }
+
+    required_inputs = {
+        "input_ids",
+        "attention_mask",
+        "token_type_ids",
+    }
+
+    missing = required_inputs - input_names
+
+    if missing:
+        raise RuntimeError(
+            f"ONNX model is missing required inputs: {missing}. "
+            f"Available inputs: {sorted(input_names)}"
         )
 
     logger.info(
-        "Direct-ONNX embedder ready — $0.00 per query, no optimum/transformers/torch"
+        "Direct-ONNX embedder ready: model=%s",
+        model_path,
     )
-    return _session
 
+    return _session
 
 def _mean_pool_normalize(last_hidden_state: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
     """
@@ -177,8 +252,8 @@ async def embed_batch(texts: list[str]) -> list[list[float]]:
         return []
     loop = asyncio.get_event_loop()
     all_vectors: list[list[float]] = []
-    for i in range(0, len(texts), 32):
-        batch = texts[i:i + 32]
+    for i in range(0, len(texts), 8):
+        batch = texts[i:i + 8]
         vectors = await loop.run_in_executor(_executor, _encode_sync, batch)
         all_vectors.extend(vectors)
 

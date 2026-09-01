@@ -1,50 +1,62 @@
 """
-embedder.py — local ONNX embedder (bge-small-en-v1.5), WITHOUT optimum
-or transformers.
+embedder.py — production local ONNX embedder (bge-small-en-v1.5).
 
-STATUS: promoted to production. This replaces the previous optimum +
-transformers-based implementation after scripts/compare_embedders.py
-validated identical output against it: query/document/batch tests all
-passed, cosine similarity 1.000000 in every case. The retired
-implementation is preserved as embedder_direct_onnx.py's sibling history
-in version control (it was the file this one was copied from verbatim,
-module docstring header aside) if a diff against the optimum-based
-version is ever needed.
+Uses ONNX Runtime directly for CPU-based embedding inference.
+No optimum, transformers, torch, or sentence-transformers are required.
 
-WHY THIS EXISTS: optimum's base install requires torch>=1.11 and datasets
-unconditionally, regardless of only using its ONNX runtime path - see the
-audit that led here. This replaces:
-  optimum.onnxruntime.ORTModelForFeatureExtraction  ->  onnxruntime.InferenceSession
-  transformers.AutoTokenizer                         ->  tokenizers.Tokenizer
-using the SAME already-exported model.onnx + tokenizer.json files at
-models/bge-small/ - no re-export, no re-training, same weights, same
-tokenizer pipeline (tokenizer.json IS the serialized fast-tokenizer
-pipeline transformers' AutoTokenizer was already using under the hood,
-so this tokenizes identically, not just similarly).
+The embedder uses the already-exported model files in:
+models/bge-small/
 
-WHAT'S DIFFERENT FROM THE RETIRED optimum-BASED IMPLEMENTATION, MECHANICALLY:
-  - transformers.AutoTokenizer.from_pretrained(dir) reads several files
-    (tokenizer_config.json, vocab.txt, tokenizer.json, special_tokens_map.json)
-    and picks a tokenizer implementation. tokenizers.Tokenizer.from_file()
-    reads tokenizer.json ALONE - it's a fully self-contained serialization
-    of the same pipeline (normalizer, pre-tokenizer, model, post-processor
-    that adds [CLS]/[SEP]), so this loads the same pipeline, not a
-    reimplementation of it.
-  - padding=True / truncation=True (per-call kwargs on AutoTokenizer) become
-    enable_padding()/enable_truncation() (configured once on the Tokenizer
-    object, applied on every encode_batch() call after that).
-  - The HF "fast" tokenizer's .input_ids/.attention_mask/.token_type_ids
-    become tokenizers' Encoding.ids/.attention_mask/.type_ids - same data,
-    different attribute names.
-  - ORTModelForFeatureExtraction(**inputs) returning an object with
-    .last_hidden_state becomes session.run(output_names, input_feed)
-    returning a plain list of numpy arrays, looked up by output name
-    instead of attribute access.
+Required files:
+- model.onnx
+- tokenizer.json
+- special_tokens_map.json
 
-Everything else - the query prefix, max_length=512, mean pooling, L2
-normalization, batch size 32, the async embed_text/embed_batch interface -
-is unchanged on purpose: this is a true drop-in replacement, not a
-rewrite. Nothing that imports this module needs to change.
+The tokenizer is loaded directly with tokenizers.Tokenizer, while
+onnxruntime.InferenceSession executes the embedding model.
+
+Embedding pipeline:
+text
+↓
+tokenizer
+↓
+ONNX Runtime
+↓
+last_hidden_state
+↓
+attention-mask weighted mean pooling
+↓
+L2 normalization
+↓
+embedding vector
+
+Query embeddings use the BGE-small-en-v1.5 search instruction:
+"Represent this sentence for searching relevant passages: ..."
+
+Document embeddings are generated without the query instruction.
+
+The resulting vectors are L2-normalized and are therefore suitable for
+Qdrant's COSINE similarity metric.
+
+The public interface is intentionally small and stable:
+
+    load_embedder(cfg)
+    embed_text(text, is_query=True)
+    embed_batch(texts)
+
+load_embedder() is called once during application startup.
+
+embed_text() and embed_batch() run the CPU-bound ONNX inference inside
+a ThreadPoolExecutor so embedding work does not block FastAPI's async
+event loop.
+
+Batch embedding is performed in small batches to balance CPU utilization
+and memory usage during repository ingestion.
+
+This module is the production embedding backend used by the retrieval
+pipeline. Other parts of the application should interact with it through
+the public functions above rather than depending directly on ONNX Runtime
+or tokenizer internals.
 """
 
 import asyncio
@@ -58,9 +70,16 @@ import numpy as np
 import onnxruntime as ort
 from tokenizers import Tokenizer
 
+__all__ = [
+    "load_embedder",
+    "embed_text",
+    "embed_batch",
+]
+
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["ORT_NUM_THREADS"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 logger = logging.getLogger(__name__)
 
 MODEL_DIR = "./models/bge-small"
@@ -68,8 +87,8 @@ MODEL_DIR = "./models/bge-small"
 _tokenizer: Tokenizer | None = None
 _session: ort.InferenceSession | None = None
 _output_names: list[str] | None = None
-_executor = ThreadPoolExecutor(max_workers=4)
 
+_executor = ThreadPoolExecutor(max_workers=4)
 
 def load_embedder(cfg):
     """
@@ -113,7 +132,7 @@ def load_embedder(cfg):
     sess_options.intra_op_num_threads = 1
     sess_options.inter_op_num_threads = 1
 
-    model_path = os.path.join(MODEL_DIR, "model.onnx")
+    model_path = os.path.join(MODEL_DIR, "model_int8.onnx")
     _session = ort.InferenceSession(
         model_path,
         sess_options=sess_options,
@@ -222,7 +241,7 @@ async def embed_batch(texts: list[str]) -> list[list[float]]:
     Embed many texts at once — used during ingest for hundreds of chunks.
 
     Batching matters: one forward pass over 32 texts is much faster than
-    32 separate forward passes, because the model's matrix multiplications
+    8 separate forward passes, because the model's matrix multiplications
     are more efficient at larger batch sizes (better CPU/SIMD utilization).
     """
     if not texts:

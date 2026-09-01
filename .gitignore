@@ -11,8 +11,12 @@ __pycache__/
 
 .cache/
 .huggingface/
-/models/
-*.onnx
-repos/
-
-*.log
+# Production embedding model
+!models/
+!models/bge-small/
+!models/bge-small/model_int8.onnx
+!models/bge-small/tokenizer.json
+!models/bge-small/special_tokens_map.json
+!models/bge-small/tokenizer_config.json
+!models/bge-small/vocab.txt
+!models/bge-small/config.json

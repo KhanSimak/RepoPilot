@@ -1,16 +1,47 @@
 """
-main.py — FastAPI application entry point, final phase
+main.py — FastAPI application entry point.
 
-Every engine loaded once at startup and stashed on app.state:
-  qdrant, embedder (ONNX), reranker (CrossEncoder), redis.
+Initializes the application's shared infrastructure during startup and
+stores the initialized components on app.state for reuse across requests.
 
-Routers:
-  /repos    — register, status, delete, AND /sync (incremental ingest)
-  /repos/.../search   — Phase 2 baseline: hybrid search, no HyDE/rerank/trace
-  /repos/.../ask       — final pipeline: HyDE + hybrid + graph + rerank + budget + trace
-  /repos/.../stream    — same pipeline, SSE
-  /stats    — cache hit rate
-  /eval     — retrieval benchmark (Recall@5, Recall@10, MRR, latency, worst files)
+Startup components:
+  - Qdrant: vector storage and similarity search
+  - ONNX Runtime embedder: local CPU embedding inference
+  - CrossEncoder reranker: candidate reranking
+  - Redis: embedding/conversation/cache storage
+
+Application routes:
+  /repos
+      Repository registration, ingestion, status, deletion, and sync.
+
+  /repos/{repo_id}/search
+      Baseline hybrid retrieval using vector search, BM25, and RRF.
+
+  /repos/{repo_id}/ask
+      Full retrieval pipeline including query rewriting, hybrid retrieval,
+      call-graph expansion, reranking, context compression, and token
+      budget enforcement.
+
+  /repos/{repo_id}/stream
+      Streaming version of the full query pipeline using Server-Sent Events.
+
+  /repos/{repo_id}/graph
+      Call-graph exploration endpoints.
+
+  /stats
+      Cache and system statistics.
+
+  /eval
+      Retrieval evaluation including Recall@K, MRR, and latency metrics.
+
+All heavyweight components are initialized once during application startup
+rather than being recreated for individual requests.
+
+The initialized components are exposed through app.state so routers and
+services can share the same Qdrant client, ONNX session, reranker, Redis
+connection, and application configuration.
+
+The application shuts down by closing the shared Redis connection.
 """
 import logging
 import os

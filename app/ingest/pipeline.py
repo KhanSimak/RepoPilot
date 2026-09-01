@@ -177,6 +177,7 @@ import logging
 from pathlib import Path
 from typing import AsyncIterator, Iterator
 import git
+import resource
 
 from app.models.chunk import CodeChunk, ChunkMeta
 from app.ingest.chunk_spool import ChunkSpool

@@ -94,6 +94,111 @@ def build_called_by(all_chunks: list) -> None:
     logger.info(f"Call graph built: {len(all_chunks)} nodes, {total_edges} called_by edges")
 
 
+def _resolve_graph_neighbors(
+    current_chunk: dict,
+    callee_name: str,
+    name_index: dict[str, list[dict]],
+    qualified_index: dict[tuple[str, str], dict],
+) -> list[dict]:
+    """
+    Resolve a call-graph edge from a call-site name to actual chunks.
+
+    AST extraction stores calls as bare names:
+        self.dispatch_request() -> "dispatch_request"
+
+    Chunks may be stored with qualified names:
+        "Flask.dispatch_request"
+
+    Resolve in increasingly broad scopes so bare names can reach their
+    qualified definitions without requiring a full type checker.
+    """
+
+    resolved = []
+    seen_ids = set()
+
+    def add(chunks):
+        for chunk in chunks:
+            chunk_id = chunk.get("id")
+            if chunk_id not in seen_ids:
+                seen_ids.add(chunk_id)
+                resolved.append(chunk)
+
+    current_file = current_chunk["file"]
+    current_name = current_chunk.get("name", "")
+
+    # ---------------------------------------------------------
+    # 1. Exact qualified/same-file lookup
+    # ---------------------------------------------------------
+    exact = qualified_index.get((current_file, callee_name))
+    if exact is not None:
+        add([exact])
+
+    # ---------------------------------------------------------
+    # 2. Direct exact name lookup
+    #
+    # Useful for genuinely unqualified functions/classes.
+    # ---------------------------------------------------------
+    add(name_index.get(callee_name, []))
+
+    # ---------------------------------------------------------
+    # 3. Same owner/class lookup
+    #
+    # Example:
+    #   current = Flask.full_dispatch_request
+    #   call    = dispatch_request
+    #
+    #   -> Flask.dispatch_request
+    # ---------------------------------------------------------
+    if "." in current_name:
+        owner = current_name.rsplit(".", 1)[0]
+        qualified_name = f"{owner}.{callee_name}"
+        add(name_index.get(qualified_name, []))
+
+    # ---------------------------------------------------------
+    # 4. Same-file qualified suffix lookup
+    #
+    # Handles cases where the caller's owner cannot be inferred
+    # cleanly but the target exists in the same module.
+    # ---------------------------------------------------------
+    suffix = f".{callee_name}"
+
+    for chunks in name_index.values():
+        for chunk in chunks:
+            if chunk.get("file") != current_file:
+                continue
+
+            if chunk.get("name", "").endswith(suffix):
+                add([chunk])
+
+    # ---------------------------------------------------------
+    # 5. Global qualified suffix fallback
+    #
+    # This is deliberately last because:
+    #
+    #   foo.save()
+    #
+    # could correspond to several Class.save methods.
+    #
+    # The earlier same-owner/same-file resolutions are preferred.
+    # ---------------------------------------------------------
+    if not resolved:
+        for chunks in name_index.values():
+            for chunk in chunks:
+                if chunk.get("name", "").endswith(suffix):
+                    add([chunk])
+
+    # ---------------------------------------------------------
+    # Constructor resolution
+    #
+    # ClassName(...) -> ClassName.__init__
+    # ---------------------------------------------------------
+    for chunk in list(resolved):
+        if chunk.get("type") == "class":
+            init_name = f"{callee_name}.__init__"
+            add(name_index.get(init_name, []))
+
+    return resolved
+
 def expand_by_graph(
     entry_chunks: list[dict],
     name_index: dict[str, list[dict]],
@@ -147,29 +252,12 @@ def expand_by_graph(
 
             for name in neighbor_names:
 
-                current_file = chunk["file"]
-
-# Try exact file + symbol first
-                neighbors = qualified_index.get((current_file, name))
-
-                if neighbors is not None:
-                    neighbors = [neighbors]      # if qualified_index stores a single chunk
-                else:
-                    neighbors = name_index.get(name, [])
-
-                # Constructor resolution, mirrored from build_called_by's
-                # ingest-time fix: a bare call target that names a class
-                # (`ClassName(...)`) should also reach that class's
-                # __init__ chunk, wherever it's defined — not just when
-                # the class happens to be in the same file as the call
-                # (the qualified_index branch above) or already carries a
-                # called_by edge from ingest. Generic for any class.
-                neighbors = list(neighbors)
-                for neighbor in list(neighbors):
-                    if neighbor.get("type") == "class":
-                        for init_chunk in name_index.get(f"{name}.__init__", []):
-                            if init_chunk not in neighbors:
-                                neighbors.append(init_chunk)
+                neighbors = _resolve_graph_neighbors(
+                    current_chunk=chunk,
+                    callee_name=name,
+                    name_index=name_index,
+                    qualified_index=qualified_index,
+                )
 
                 for neighbor in neighbors:
 

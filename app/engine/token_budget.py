@@ -57,6 +57,28 @@ except Exception:
 MAX_CONTEXT_TOKENS   = 2500   # hard cap on total context sent to the final LLM call
 MAX_TOKENS_PER_CHUNK = 150   # budget for each individual compression call
 
+# The smallest truncated inclusion still worth sending. Below this, a
+# "truncated" chunk would be mostly wrapper metadata with a token or two
+# of code - not useful context, just wasted tokens - so once remaining
+# budget drops below this floor, remaining low-priority candidates are
+# left out entirely rather than included as noise.
+MIN_CHUNK_TOKENS = 40
+
+# No single chunk may claim more than this fraction of the whole budget.
+# Without a cap, the highest-scoring chunk (very often a large class
+# definition - it's typically the single best semantic match for a
+# question about the concept it implements) gets processed first and,
+# even truncated, can consume the ENTIRE effective budget by itself -
+# leaving zero room for every other gathered chunk, including the
+# specific methods that actually answer the question. This is what
+# produced answers describing only a class's skeleton while claiming its
+# own methods (which were correctly gathered and sitting in
+# gathered_chunks the whole time) were "missing". Applied as a ceiling,
+# not a target - a chunk that fits within its share unclipped is still
+# included in full; this only kicks in for a chunk large enough to
+# otherwise crowd out everything else.
+MAX_CHUNK_BUDGET_SHARE = 0.5
+
 # select_context() used to budget ONLY chunk["text"] - the raw code slice -
 # even though MAX_CONTEXT_TOKENS's own comment above promises a cap on
 # "total context sent to the final LLM call". What actually gets sent
@@ -99,7 +121,126 @@ def _tighten_instructions(text: str) -> str:
     return re.sub(r"\n[ \t]*\n+", "\n", text).strip()
 
 
-def select_context(chunks: list[dict], max_tokens: int = MAX_CONTEXT_TOKENS):
+def _symbol_owner(name: str) -> str | None:
+    """The qualified owner of a symbol - 'ClassName' for
+    'ClassName.method_name' - or None for a bare, unqualified name (a
+    module-level function or the class itself). Same dotted-qualified-name
+    convention already used elsewhere in this codebase (e.g. the call
+    graph's own bare/qualified matching) - not a new naming scheme."""
+    if not name or "." not in name:
+        return None
+    return name.rsplit(".", 1)[0]
+
+
+def _prioritize_by_structure(chunks: list[dict],priority_names: set[str] | None = None) -> list[dict]:
+    """Order chunks for selection: reranker/relevance score first, with a
+    bounded boost for chunks structurally related to OTHER chunks in this
+    SAME candidate set - so a symbol that's actually part of the same
+    concept as the rest of what was retrieved outranks an unrelated,
+    higher-scoring-by-coincidence chunk that happens to share some
+    vocabulary with the question but has no real relationship to
+    anything else gathered.
+
+    Generic by construction - only two signals, both already central to
+    this codebase's own call-graph machinery, no framework-specific rules:
+      - calls/called_by CONNECTIVITY: how many of a chunk's own calls/
+        called_by names match another chunk actually present in THIS
+        candidate set (not the whole repo - scoped to what's actually
+        being considered for this prompt).
+      - symbol OWNERSHIP: chunks sharing a qualified-name prefix (i.e.
+        the same class) as another chunk that scored well are likely
+        part of the same relevant concept, even without a direct call
+        edge between them (e.g. two sibling methods on the same class).
+
+    Deliberately does NOT use graph_score (expand_by_graph's flat "0.05
+    per hop from the entry point" decay in call_graph.py) - that's a
+    distance heuristic from an entirely different stage (graph
+    expansion), not a relevance signal, and testing showed it doesn't
+    correlate well with what's actually worth keeping in this budget.
+    This computes its own connectivity signal instead, scoped to exactly
+    the chunks being considered here.
+
+    The boost is bounded and additive to (never a replacement for) the
+    underlying rerank/relevance score, so a chunk with no structural
+    relationship to anything else still gets selected purely on its own
+    score - this only ever helps break ties and reorder among otherwise-
+    similar candidates, not override a strong signal with a weak one.
+    """
+    names_in_set = {c.get("name") for c in chunks if c.get("name")}
+    bare_names_in_set = {n.rsplit(".", 1)[-1] for n in names_in_set}
+
+    owners: dict[str, list[dict]] = {}
+    for c in chunks:
+        owner = _symbol_owner(c.get("name", ""))
+        if owner:
+            owners.setdefault(owner, []).append(c)
+
+    def base_score(c: dict) -> float:
+        return c.get("rerank_score", c.get("score", 0.0))
+
+    def connectivity(c: dict) -> int:
+        neighbors = list(c.get("calls") or []) + list(c.get("called_by") or [])
+        if not neighbors:
+            return 0
+        return sum(
+            1 for n in neighbors
+            if n in names_in_set or n in bare_names_in_set
+        )
+
+    def ownership_boost(c: dict) -> float:
+        owner = _symbol_owner(c.get("name", ""))
+        if not owner or owner not in owners:
+            return 0.0
+        siblings = [s for s in owners[owner] if s is not c]
+        if not siblings:
+            return 0.0
+        return max((base_score(s) for s in siblings), default=0.0)
+
+    def priority(c: dict) -> float:
+        connectivity_component = min(connectivity(c), 4) * 0.05
+        ownership_component = ownership_boost(c) * 0.15
+        explicit_component = (
+            1.0 if priority_names and c.get("name") in priority_names else 0.0
+        )
+
+        return (
+            base_score(c)
+            + connectivity_component
+            + ownership_component
+            + explicit_component
+        )
+    return sorted(chunks, key=priority, reverse=True)
+
+
+def _extract_explicit_symbols(
+    question: str,
+    chunks: list[dict],
+) -> set[str]:
+    """Return symbols explicitly named in the question.
+
+    Prefer the most specific qualified symbols. A parent symbol such as
+    ``Flask`` is not considered explicit when the question names more
+    specific symbols such as ``Flask.wsgi_app``.
+    """
+    question_lower = question.lower()
+
+    candidates = {
+        c["name"]
+        for c in chunks
+        if c.get("name") and c["name"].lower() in question_lower
+    }
+
+    return {
+        name
+        for name in candidates
+        if not any(
+            other != name
+            and other.lower().startswith(name.lower() + ".")
+            and other.lower() in question_lower
+            for other in candidates
+        )
+    }
+def select_context(chunks: list[dict], max_tokens: int = MAX_CONTEXT_TOKENS,priority_names: set[str] | None = None):
     production = [
       c for c in chunks
        if (
@@ -110,16 +251,22 @@ def select_context(chunks: list[dict], max_tokens: int = MAX_CONTEXT_TOKENS):
  
     if production:
       chunks = production
-    chunks = sorted(
-      chunks,
-      key=lambda c: c.get(
-          "rerank_score",
-          c.get("graph_score", c.get("score", 0)),
-      ),
-      reverse=True,
-)
+    priority_names = priority_names or set()
+    chunks = _prioritize_by_structure(chunks, priority_names)
+
+    if priority_names:
+        chunks = sorted(
+            chunks,
+            key=lambda c: (
+                c.get("name") in priority_names,
+                c.get("rerank_score", c.get("score", 0.0)),
+            ),
+            reverse=True,
+        )
+
     selected = []
     used = 0
+    truncated_count = 0
 
     # Everything build_prompt() adds around the chunks themselves -
     # system_prompt plus user_msg's fixed boilerplate - comes out of the
@@ -129,42 +276,89 @@ def select_context(chunks: list[dict], max_tokens: int = MAX_CONTEXT_TOKENS):
         0, max_tokens - _SYSTEM_PROMPT_RESERVE_TOKENS - _USER_MSG_WRAPPER_TOKENS
     )
 
-    for chunk in chunks:
-      # Do not cut a selected implementation at an arbitrary character
-      # boundary.  The existing token budget below is the single authority
-      # for deciding whether a complete chunk fits.
-      text = chunk["text"]
+    capped_entries = []  # (index into `selected`, original full text) for
+                          # chunks trimmed only by the per-chunk share cap
+                          # - kept so leftover budget can top them back up
+                          # afterward, without re-matching chunks by id.
 
+    for chunk in chunks:
       # + the per-chunk metadata wrapper build_prompt() adds (Symbol N /
       # Type / Name / File / Lines / Calls / Called by / Registered via /
       # Code: labels) - not just the raw code text - so a chunk that
       # "fits" here actually fits once wrapped, not just on its own.
-      tokens = count_tokens(text) + _PER_CHUNK_WRAPPER_OVERHEAD_TOKENS
+      text = chunk["text"]
+      full_tokens = count_tokens(text) + _PER_CHUNK_WRAPPER_OVERHEAD_TOKENS
+      remaining = effective_max_tokens - used
 
-      if used + tokens > effective_max_tokens:
-       # Never produce an empty prompt merely because the strongest chunk is
-       # larger than the context budget.
-       if not selected and effective_max_tokens > 0:
-        truncate_to = max(0, effective_max_tokens - _PER_CHUNK_WRAPPER_OVERHEAD_TOKENS)
+      # A chunk may use whichever is smaller: what's actually left, or
+      # its fixed per-chunk share of the TOTAL budget (not of whatever
+      # happens to be remaining) - fixed so the cap doesn't quietly
+      # shrink to nothing after a couple of earlier chunks, and doesn't
+      # depend on processing order.
+      per_chunk_cap = max(MIN_CHUNK_TOKENS, int(effective_max_tokens * MAX_CHUNK_BUDGET_SHARE))
+      allowed = min(remaining, per_chunk_cap)
+
+      if full_tokens > allowed:
+        # Doesn't fit within what's allowed. Truncate it to that amount
+        # instead of dropping it outright - a partial chunk (the start of
+        # an important large implementation, or a lower-priority chunk
+        # trimmed to what's left) is still useful context; silently
+        # discarding it is not. Only skip entirely once there isn't even
+        # a minimally useful amount of ACTUAL CODE room left after the
+        # wrapper - MIN_CHUNK_TOKENS is a floor on usable code content,
+        # not on `allowed` as a whole, since the wrapper overhead alone
+        # can exceed MIN_CHUNK_TOKENS: checking `allowed < MIN_CHUNK_TOKENS`
+        # would let a chunk through with a positive `allowed` that's
+        # entirely consumed by wrapper metadata and zero actual code.
+        if allowed - _PER_CHUNK_WRAPPER_OVERHEAD_TOKENS < MIN_CHUNK_TOKENS:
+            continue
+
+        truncate_to = max(0, allowed - _PER_CHUNK_WRAPPER_OVERHEAD_TOKENS)
         if "_enc" in globals():
-         text = _enc.decode(_enc.encode(text)[:truncate_to])
+            truncated_text = _enc.decode(_enc.encode(text)[:truncate_to])
         else:
-         text = text[:truncate_to * 4]
-        tokens = count_tokens(text) + _PER_CHUNK_WRAPPER_OVERHEAD_TOKENS
-       else:
-        continue
+            truncated_text = text[:truncate_to * 4]
+        tokens = count_tokens(truncated_text) + _PER_CHUNK_WRAPPER_OVERHEAD_TOKENS
+        truncated_count += 1
+        was_capped_by_share = allowed == per_chunk_cap and per_chunk_cap < remaining
 
-      chunk = {**chunk}
-      chunk["text"] = text
+        selected.append({**chunk, "text": truncated_text})
+        used += tokens
+        if was_capped_by_share:
+            # Remember the ORIGINAL (untruncated) text so a later top-up
+            # pass can extend it if other chunks leave budget unused.
+            capped_entries.append((len(selected) - 1, text))
+      else:
+        selected.append({**chunk})
+        used += full_tokens
 
-      selected.append(chunk)
-      used += tokens
+    # Top-up pass: a chunk trimmed only because of its own share cap (not
+    # because room had genuinely run out) may still be missing content
+    # that other, lower-priority chunks never actually needed. Give
+    # leftover budget back to the highest-priority capped chunk first
+    # (capped_entries is already in priority order, since `chunks` was).
+    for idx, original_text in capped_entries:
+        leftover = effective_max_tokens - used
+        if leftover < MIN_CHUNK_TOKENS:
+            break
+        current_tokens = count_tokens(selected[idx]["text"])
+        full_tokens_available = count_tokens(original_text)
+        extra = min(leftover, full_tokens_available - current_tokens)
+        if extra <= 0:
+            continue
+        target_tokens = current_tokens + extra
+        if "_enc" in globals():
+            new_text = _enc.decode(_enc.encode(original_text)[:target_tokens])
+        else:
+            new_text = original_text[:target_tokens * 4]
+        used += count_tokens(new_text) - current_tokens
+        selected[idx]["text"] = new_text
 
     logger.info(
         f"Context budget: {used}/{effective_max_tokens} chunk tokens "
         f"({used + _SYSTEM_PROMPT_RESERVE_TOKENS + _USER_MSG_WRAPPER_TOKENS}/{max_tokens} "
         f"total est. incl. system_prompt+wrapper) "
-        f"({len(selected)}/{len(chunks)} chunks)"
+        f"({len(selected)}/{len(chunks)} chunks, {truncated_count} truncated)"
     )
     logger.debug(
         "Selected context: %s",

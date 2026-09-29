@@ -18,7 +18,7 @@ from openai import AsyncOpenAI
 
 from app.agent.state import AgentState
 from app.agent.tools import retrieval_tool, expand_graph_tool
-from app.engine.token_budget import select_context, build_prompt, count_tokens
+from app.engine.token_budget import _extract_explicit_symbols, select_context, build_prompt, count_tokens
 from app.engine.reranker import rerank, is_low_confidence
 from app.config import get_settings
 
@@ -373,6 +373,62 @@ def _expansion_unlikely_to_add_evidence(
     return neighbor_names.issubset(known_symbols)
 
 
+def _low_value_expansion_target(
+    chunk: dict,
+    known_symbols: set[str],
+    question: str,
+    missing_requirements: list[str] | None,
+) -> bool:
+    """True if expanding this symbol is a poor use of an expand_graph
+    call - either because it's predicted redundant (see
+    _expansion_unlikely_to_add_evidence), or because it's weakly related
+    to the question/missing-requirements (see _relevance_score).
+
+    THE GAP THIS CLOSES: select_execution_path_symbol's relevance-first
+    ranking (question/missing-requirement overlap, then connectivity,
+    then implementation, then unexplored status) only ever runs inside
+    the SYSTEM'S OWN deterministic re-picks - _preferred_graph_symbol,
+    the "already expanded" redirect, the runtime evidence gate, the
+    JSON-parse-failure fallback. On an ordinary turn where the reasoning
+    model freely proposes its OWN expand_graph target and none of those
+    redirect conditions happen to fire, that choice was previously
+    validated only for "is it gathered", "is it already expanded", and
+    "is it predicted redundant" - never for whether it has anything to do
+    with the question at all. A symbol like Flask.url_for or a bare `get`
+    can be perfectly real and not-yet-known-to-be-redundant (a gathered
+    chunk genuinely calls it, and ITS neighbors aren't all already known
+    either) while being completely irrelevant to what was actually
+    asked - that's exactly how the agent kept wandering into it: nothing
+    upstream of expand_graph_node was ever checking relevance against the
+    model's own fresh choice, only against the system's own re-picks.
+
+    Weak-relatedness only applies when there's something to be relevant
+    TO (query_terms non-empty) - with nothing to compare against, this
+    reduces to the pre-existing redundancy-only check, unchanged.
+    """
+    if _expansion_unlikely_to_add_evidence(chunk, known_symbols):
+        return True
+
+    # Prefer the sharper, more specific signal (what's STILL needed) over
+    # the full question text when available - the same "prefer the
+    # sharper signal" precedent _gathered_evidence_sufficient already
+    # establishes for entity_terms vs. general topic words. Without this,
+    # a symbol qualified by the framework/class name (e.g.
+    # "Flask.url_for") trivially shares a term with almost any question
+    # ABOUT that framework ("how does Flask handle sessions") purely
+    # because both mention "Flask" - which would defeat this check for
+    # exactly the kind of symbol it exists to catch. missing_requirements
+    # text is inherently more specific (it's literally "what's still
+    # needed", stated by the reasoning model itself) and essentially
+    # always populated by the time this runs past the first turn.
+    query_terms = (
+        _relevance_terms("", missing_requirements)
+        if missing_requirements
+        else _relevance_terms(question, None)
+    )
+    return bool(query_terms) and _relevance_score(chunk, query_terms) == 0
+
+
 def _connected_unexpanded_symbols(
     chunks: list[dict], trace: list[str]
 ) -> list[dict]:
@@ -607,11 +663,50 @@ def _is_abstract_chunk(chunk: dict) -> bool:
     )
 
 
-def _execution_evidence_incomplete(chunks: list[dict]) -> bool:
-    """Keep flow investigations open until graph and runtime evidence agree."""
+def _execution_evidence_incomplete(
+    chunks: list[dict], *, query_terms: set[str] | None = None
+) -> bool:
+    """Keep flow investigations open until graph and runtime evidence agree.
+
+    query_terms, when given, narrows the connectivity COUNT below to
+    chunks relevant to the question/outstanding requirements/named
+    entities (_relevance_score - the same generic term-overlap signal
+    used elsewhere in this file, not a new heuristic). Without it, this
+    counts ANY 3 connected chunks anywhere, regardless of relevance -
+    which blocks early-stopping even once every symbol the question
+    actually asked about has already been found and its implementation
+    gathered, purely because that genuinely-relevant evidence (or even a
+    single specific symbol's implementation) doesn't happen to total 3
+    connected chunks on its own. Optional and defaults to the original,
+    unfiltered behavior for any caller with no specific question to judge
+    relevance against - _has_runtime_implementation below is
+    intentionally left unfiltered either way, since "is there real code
+    anywhere in what's gathered" is a coarser, still-useful check on its
+    own regardless of which chunks are relevant.
+    """
+    connectivity_chunks = chunks
+    min_connected = 3
+    if query_terms:
+        relevant = [c for c in chunks if _relevance_score(c, query_terms) > 0]
+        if relevant:
+            # Once we know which chunks are actually relevant, requiring
+            # the same flat "3" calibrated for an UNFILTERED, relevance-
+            # blind count no longer makes sense - a question whose
+            # genuinely relevant evidence is a single symbol's
+            # implementation (or two connected ones) would never clear an
+            # arbitrary floor that has nothing to do with how much of
+            # THIS question's request has actually been covered. One
+            # relevant, connected chunk is enough here - this isn't
+            # standing in alone for "was real investigation done" (the
+            # runtime-implementation check below, and understand_flow's
+            # own separate _expanded_symbols requirement, still apply),
+            # just for "is what was found connected, not an isolated
+            # retrieval hit with no relationship to anything else gathered".
+            connectivity_chunks = relevant
+            min_connected = 1
     return needs_more_context(
-        chunks,
-        min_connected_symbols=3,
+        connectivity_chunks,
+        min_connected_symbols=min_connected,
     ) or not _has_runtime_implementation(chunks)
 
 
@@ -644,6 +739,54 @@ def _haystack_terms(chunk: dict) -> set[str]:
             if part:
                 terms.add(_stem(part))
     return terms
+
+
+_CAMEL_SPLIT_RE = re.compile(r"[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])")
+
+
+def _entity_terms(question: str) -> set[str]:
+    """Stemmed terms from words in the ORIGINAL question that look like
+    they're naming a specific code entity - snake_case, a dotted
+    qualified name (Class.method), CamelCase/PascalCase, or an ALL_CAPS
+    constant - as opposed to ordinary English words.
+
+    Runs on the question BEFORE _topic_terms' lowercasing, deliberately:
+    casing and punctuation are exactly the signal that distinguishes
+    "the question is asking about THIS symbol" from "the question
+    happens to share a word with some symbol somewhere". A CamelCase or
+    snake_case word gets split into its sub-words (ConnectionPool ->
+    connection, pool) so it matches _haystack_terms' own splitting of
+    identifiers, the same way `_haystack_terms` already splits
+    `load_config` into "load" and "config".
+
+    Generic pattern matching only - no framework-specific names, no
+    hardcoded symbol list. A question with no such patterns (a purely
+    descriptive "how does X work", no explicit identifiers) yields an
+    empty set, and callers fall back to general topic-word coverage
+    unchanged - see _gathered_evidence_sufficient.
+    """
+    candidates = re.findall(r"[A-Za-z_][A-Za-z0-9_.]*", question)
+    entities: set[str] = set()
+    for word in candidates:
+        bare = word.strip(".")
+        if len(bare) < 3:
+            continue
+        looks_like_entity = (
+            "_" in bare
+            or "." in bare
+            or (any(c.isupper() for c in bare) and any(c.islower() for c in bare))
+            or (bare.isupper() and bare.isalpha())
+        )
+        if not looks_like_entity:
+            continue
+        for segment in re.split(r"[_.]", bare):
+            if not segment:
+                continue
+            for sub in (_CAMEL_SPLIT_RE.findall(segment) or [segment]):
+                sub = sub.lower()
+                if sub and sub not in _TOPIC_STOP_WORDS:
+                    entities.add(_stem(sub))
+    return entities
 
 
 def _relevance_terms(question: str, missing_requirements: list[str] | None) -> set[str]:
@@ -709,7 +852,13 @@ def _gathered_evidence_sufficient(
     Generic: no framework-specific names or terms anywhere - only the
     same structural signals (_has_runtime_implementation via
     _execution_evidence_incomplete) and question-derived term overlap
-    (_topic_terms) already used elsewhere in this file.
+    (_topic_terms) already used elsewhere in this file. When the
+    question explicitly names a specific code entity (CamelCase,
+    snake_case, a dotted qualified name, or an ALL_CAPS constant - see
+    _entity_terms), coverage of THOSE terms specifically overrides the
+    general topic-word ratio below: full coverage stops immediately,
+    and any named entity that's genuinely missing keeps the
+    investigation going even if the broader ratio would otherwise pass.
 
     understand_flow gets one extra requirement on top of all the above.
     A chunk's `calls`/`called_by` are populated at ingest time - present
@@ -731,10 +880,22 @@ def _gathered_evidence_sufficient(
     investigation done. Generic BFS-frontier reasoning, not a fixed
     per-question stage count or any framework-specific symbol name.
     """
-    if not chunks or _execution_evidence_incomplete(chunks):
+    if not chunks:
         return False
 
     trace = reasoning_trace or []
+    topic = _relevance_terms(question, None)
+    entity_terms = _entity_terms(question)
+    # Prefer the stronger, more specific signal (explicitly-named symbols)
+    # when the question has one; otherwise fall back to general topic
+    # words - same priority _entity_terms' own docstring and the coverage
+    # check below already establish, just applied here too so the FIRST
+    # gate (_execution_evidence_incomplete) doesn't block on raw
+    # connectivity count before ever reaching that logic.
+    query_terms = entity_terms or topic
+
+    if _execution_evidence_incomplete(chunks, query_terms=query_terms):
+        return False
 
     if intent == "understand_flow":
         if not _expanded_symbols(trace):
@@ -747,11 +908,25 @@ def _gathered_evidence_sufficient(
         promising = [
             c for c in remaining
             if not _expansion_unlikely_to_add_evidence(c, known_symbols)
+            # Structural connectivity alone doesn't justify continuing:
+            # an unexpanded symbol can be genuinely connected (real
+            # calls/called_by, not a dead end) while having nothing to
+            # do with the question - e.g. pulled into gathered_chunks by
+            # an earlier expansion into an unrelated part of the
+            # codebase. Only a candidate that's BOTH structurally
+            # promising AND has some actual lexical overlap with the
+            # question counts as "more of the flow left to walk" -
+            # otherwise every investigation stalls at MAX_AGENT_ITERATIONS
+            # chasing whatever's structurally richest in the accumulated
+            # pool, relevant or not. When there's no distinctive topic to
+            # check against (`topic` empty), every structurally-promising
+            # candidate still counts, same as before this change - there
+            # is nothing to filter by, so nothing new is enforced.
+            and (not topic or _relevance_score(c, topic) > 0)
         ]
         if promising:
             return False
 
-    topic = {_stem(term) for term in _topic_terms(question)}
     if not topic:
         # Nothing distinctive to check lexical coverage against - the
         # structural completeness check above is all there is to go on.
@@ -760,6 +935,27 @@ def _gathered_evidence_sufficient(
     haystack_terms: set[str] = set()
     for chunk in chunks:
         haystack_terms |= _haystack_terms(chunk)
+
+    # Terms that look like they're naming a SPECIFIC code entity (a
+    # snake_case/CamelCase identifier, a dotted qualified name, or an
+    # ALL_CAPS constant) are a much stronger, more decisive signal than
+    # ordinary topic-word overlap: if the question explicitly names
+    # something and gathered evidence already has it, that IS direct
+    # coverage of "the important symbols/entities asked about" - stop,
+    # regardless of how the broader topic-word ratio below would
+    # otherwise come out (it might be short of 50% purely because of
+    # generic descriptive words in the question that were never the
+    # point). Conversely, an explicitly-named entity that's genuinely
+    # absent is exactly "important requested evidence... missing" -
+    # decisive the other way too, so this does NOT fall through to the
+    # general ratio check when some but not all named entities are
+    # covered. A question that names no specific entities at all (a
+    # purely descriptive "how does X work") falls through unchanged to
+    # the existing general topic-coverage check below.
+    # entity_terms was already computed above (used for the connectivity
+    # gate too) - reused here unchanged.
+    if entity_terms:
+        return entity_terms <= haystack_terms
 
     covered = topic & haystack_terms
     # A flat 60% ratio means any two-term topic needs BOTH terms covered
@@ -1631,8 +1827,11 @@ async def reasoning_node(state: AgentState) -> dict:
             # a more promising connected symbol is actually available; with
             # nothing better to try, it lets the original request through
             # rather than blocking on an unverified guess.
-            elif selected_chunk and _expansion_unlikely_to_add_evidence(
-                selected_chunk, already_expanded | available_symbols
+            elif selected_chunk and _low_value_expansion_target(
+                selected_chunk,
+                already_expanded | available_symbols,
+                state["question"],
+                outstanding,
             ):
                 next_symbol = select_execution_path_symbol(
                     reranked,
@@ -1642,8 +1841,8 @@ async def reasoning_node(state: AgentState) -> dict:
                 )
                 if next_symbol and next_symbol != symbol:
                     logger.info(
-                        "'%s' is unlikely to add new evidence (all "
-                        "neighbors already known); trying '%s' instead.",
+                        "'%s' is unlikely to add new evidence or is weakly "
+                        "related to the question; trying '%s' instead.",
                         symbol,
                         next_symbol,
                     )
@@ -1651,8 +1850,9 @@ async def reasoning_node(state: AgentState) -> dict:
                     parsed["action_input"] = next_symbol
                 else:
                     logger.debug(
-                        "'%s' predicted low-yield but no better connected "
-                        "symbol is available; proceeding anyway.",
+                        "'%s' predicted low-yield/weakly related but no "
+                        "better connected symbol is available; proceeding "
+                        "anyway.",
                         symbol,
                     )
 
@@ -2133,13 +2333,43 @@ async def answer_node(state: AgentState) -> dict:
     # --------------------------------------------------
     # Select context within token budget
     # --------------------------------------------------
-    final_chunks = select_context(reranked)
+    explicit_symbols = _extract_explicit_symbols(
+        state["question"],
+        reranked,
+    )
+    logger.warning(
+        "EXPLICIT SYMBOLS: %s",
+        sorted(explicit_symbols),
+    )
+
+    final_chunks = select_context(
+        reranked,
+        priority_names=explicit_symbols,
+    )
+    logger.warning(
+        "FINAL CONTEXT: %s",
+        [
+            f"{c.get('name')} {c.get('file')}:{c.get('line_start')}-{c.get('line_end')}"
+            for c in final_chunks
+        ],
+    )
+    evidence_inventory = "\n".join(
+        f"- {c.get('name')} — {c.get('file')}:{c.get('line_start')}-{c.get('line_end')}"
+        for c in state["gathered_chunks"]
+    )
 
     system_prompt, user_msg = build_prompt(
         state["question"],
         final_chunks,
         state["intent"],
     )
+    user_msg += f"""
+
+    EVIDENCE INVENTORY:
+    {evidence_inventory}
+
+    Do not claim that a symbol is missing if it appears in the evidence inventory.
+    """
 
     logger.debug(
         "Prompt sizes: system_chars=%d user_chars=%d total_chars=%d est_tokens=%d",
@@ -2157,7 +2387,7 @@ async def answer_node(state: AgentState) -> dict:
         # symbol, so it cut answers off mid-sentence rather than the model
         # choosing to stop. 1200 gives a real flow explanation room to
         # finish while still bounding cost/latency.
-        max_completion_tokens=1200,
+        max_completion_tokens=1800,
         messages=[
             {
                 "role": "system",
